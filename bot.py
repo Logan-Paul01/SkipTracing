@@ -327,6 +327,19 @@ def main() -> None:
         raise SystemExit(1)
 
     db.init_db()
+
+    try:
+        me = bot.get_me()
+    except Exception as exc:  # noqa: BLE001 - fail clearly on a bad token
+        print(
+            "ERROR: Telegram rejected BOT_TOKEN or the API is unreachable.\n"
+            f"Details: {type(exc).__name__}. Check the token from @BotFather "
+            "and the host's network access, then try again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    logger.info("Authenticated as @%s", getattr(me, "username", "unknown"))
     logger.info("SkipTrace V1 starting (audit log: %s)", config.DB_PATH)
     logger.info("Long polling started")
     try:

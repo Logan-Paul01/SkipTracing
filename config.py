@@ -12,6 +12,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 # SQLite audit log location.
 DB_PATH = os.environ.get("DB_PATH", "skiptrace.db")
 
+# "auto" uses Maigret (falling back to the curated HTTP checks if Maigret
+# cannot load). "http" always uses the curated checks: faster and useful for
+# smoke tests or networks where Maigret's sites block the host.
+SEARCH_MODE = os.environ.get("SEARCH_MODE", "auto").strip().lower()
+
 # Maigret search behaviour.
 MAIGRET_TIMEOUT = 12
 MAIGRET_MAX_CONNECTIONS = 4

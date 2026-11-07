@@ -14,20 +14,47 @@ import config
 
 
 def _tokens(value) -> list[str]:
-    return [token for token in re.split(r"\s+", str(value or "").strip().lower()) if token]
+    """Split names and handles into comparable words.
+
+    Handles use dots/underscores as separators (chinedu.okafor) and often pack
+    both names into one token (chineduokafor), so whitespace alone is not
+    enough to compare a full name against a handle.
+    """
+    return [
+        token
+        for token in re.split(r"[\s._\-@]+", str(value or "").strip().lower())
+        if token
+    ]
 
 
 def _name_similarity(input_name, profile_name) -> float:
-    """Compare names token-by-token after sorting, so word order is free."""
-    left = sorted(_tokens(input_name))
-    right = sorted(_tokens(profile_name))
+    """Compare names against a display name or handle, order-independently."""
+    left = _tokens(input_name)
+    right = _tokens(profile_name)
     if not left or not right:
         return 0.0
 
-    total = 0.0
-    for left_token, right_token in zip(left, right):
-        total += jellyfish.jaro_winkler_similarity(left_token, right_token)
+    # A single-token handle may contain every name token (chineduokafor).
+    if len(right) == 1 and len(left) > 1:
+        packed = right[0]
+        covered = sum(
+            1 for token in left if len(token) >= 3 and token in packed
+        )
+        if covered:
+            return covered / len(left)
 
+    # With a single input token (a collector typed only a first name), a
+    # handle like chinedu.okafor should still match strongly.
+    if len(left) == 1:
+        return max(
+            jellyfish.jaro_winkler_similarity(left[0], token) for token in right
+        )
+
+    total = 0.0
+    for token in left:
+        total += max(
+            jellyfish.jaro_winkler_similarity(token, other) for other in right
+        )
     return total / max(len(left), len(right))
 
 
@@ -88,20 +115,42 @@ def score_hit(hit: dict, profile: dict, input_ctx: dict) -> dict:
     score = 0.0
     reasons: list[str] = []
 
+    # A claimed public profile is a weak lead on its own. Without this an
+    # exact name handle scored 30 and was always discarded by the 40 threshold.
+    score += 10
+    reasons.append("Public profile exists")
+
     display_name = profile.get("display_name") or hit.get("username") or ""
     similarity = _name_similarity(input_ctx.get("name"), display_name)
     if similarity > 0:
         score += similarity * 30
         reasons.append(f"Name similarity {int(round(similarity * 100))}%")
 
-    haystack = " ".join(
-        str(part or "")
-        for part in (profile.get("bio"), profile.get("display_name"), hit.get("username"))
-    )
-    matched_phone = _phone_in_text(input_ctx.get("phone_variants"), haystack)
-    if matched_phone:
-        score += 25
-        reasons.append("Phone number appears in profile text")
+    phone_variants = input_ctx.get("phone_variants") or ()
+    username_digits = re.sub(r"\D", "", str(hit.get("username") or ""))
+    phone_handle = ""
+    if len(username_digits) >= 7:
+        for variant in phone_variants:
+            if re.sub(r"\D", "", str(variant or "")) == username_digits:
+                phone_handle = variant
+                break
+
+    if phone_handle:
+        score += 35
+        reasons.append("Username is the debtor's phone number")
+    else:
+        haystack = " ".join(
+            str(part or "")
+            for part in (
+                profile.get("bio"),
+                profile.get("display_name"),
+                hit.get("username"),
+            )
+        )
+        matched_phone = _phone_in_text(phone_variants, haystack)
+        if matched_phone:
+            score += 25
+            reasons.append("Phone number appears in profile text")
 
     wanted_gender = _normalize_gender(input_ctx.get("gender"))
     profile_gender = _normalize_gender(profile.get("gender"))

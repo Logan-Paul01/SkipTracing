@@ -14,12 +14,21 @@ from phonenumbers import carrier, geocoder
 DEFAULT_REGION = "NG"
 
 
+def _ensure_nigerian(parsed: phonenumbers.PhoneNumber) -> phonenumbers.PhoneNumber:
+    if parsed.country_code != 234:
+        raise ValueError(
+            "Only Nigerian (+234) phone numbers are supported. "
+            "Send a number such as 08031234567 or +2348031234567."
+        )
+    return parsed
+
+
 def _parse(raw: str) -> phonenumbers.PhoneNumber:
     """Parse with NG first, then let phonenumbers infer the region."""
     try:
         parsed = phonenumbers.parse(raw, DEFAULT_REGION)
         if phonenumbers.is_valid_number(parsed):
-            return parsed
+            return _ensure_nigerian(parsed)
     except phonenumbers.NumberParseException:
         pass
 
@@ -36,7 +45,7 @@ def _parse(raw: str) -> phonenumbers.PhoneNumber:
             "That phone number is not valid. Send a Nigerian number such as "
             "08031234567 or +2348031234567."
         )
-    return parsed
+    return _ensure_nigerian(parsed)
 
 
 def normalize_phone(raw) -> tuple[str, list[str], dict]:

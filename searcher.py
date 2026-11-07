@@ -9,9 +9,11 @@ only touch public profile pages; no login-walled endpoints are used.
 from __future__ import annotations
 
 import asyncio
+import html
 import inspect
 import logging
 import os
+import re
 
 import aiohttp
 
@@ -26,11 +28,6 @@ USER_AGENT = (
 
 # Curated fallback sites only. Each URL is a public profile page.
 FALLBACK_SITES = (
-    {
-        "site": "Instagram",
-        "url": "https://www.instagram.com/{username}/",
-        "tags": ["social"],
-    },
     {
         "site": "TikTok",
         "url": "https://www.tiktok.com/@{username}",
@@ -224,6 +221,27 @@ async def _maigret_search_one(username: str) -> dict:
     return _maigret_hits(username, results)
 
 
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def _page_title(body: str) -> str:
+    match = _TITLE_RE.search(body or "")
+    if not match:
+        return ""
+    return " ".join(html.unescape(match.group(1)).split())
+
+
+def _title_confirms_handle(body: str, username: str) -> bool:
+    """Only count a page whose title names the requested handle.
+
+    Logged-out Instagram serves a login page for every handle, and login
+    walls are not profile evidence. A title containing the handle is a crude
+    but reliable positive signal for GitHub, TikTok and similar sites.
+    """
+    title = _page_title(body).lower()
+    return bool(title) and username.lower() in title
+
+
 async def _http_fallback_one(username: str) -> dict:
     """Check the curated public sites directly over HTTP."""
     hits: dict[str, dict] = {}
@@ -238,7 +256,7 @@ async def _http_fallback_one(username: str) -> dict:
         for site in FALLBACK_SITES:
             url = site["url"].format(username=username)
             try:
-                async with session.get(url, allow_redirects=True, ssl=False) as response:
+                async with session.get(url, allow_redirects=True) as response:
                     if response.status != 200:
                         continue
                     body = await response.text(errors="ignore")
@@ -249,14 +267,17 @@ async def _http_fallback_one(username: str) -> dict:
                 logger.debug("Fallback lookup error for %s: %s", url, exc)
                 continue
 
-            if username.lower() in body.lower():
-                hits[site["site"]] = {
-                    "site": site["site"],
-                    "url": url,
-                    "username": username,
-                    "tags": list(site["tags"]),
-                    "source": "http",
-                }
+            if not _title_confirms_handle(body, username):
+                logger.debug("Skipping %s: no profile title for %s", url, username)
+                continue
+
+            hits[site["site"]] = {
+                "site": site["site"],
+                "url": url,
+                "username": username,
+                "tags": list(site["tags"]),
+                "source": "http",
+            }
 
     return hits
 
@@ -272,10 +293,15 @@ async def search_usernames(usernames) -> list[dict]:
     hits: list[dict] = []
     seen_urls: set[str] = set()
     batch_size = max(1, config.MAIGRET_MAX_CONNECTIONS // 2)
+    mode = (getattr(config, "SEARCH_MODE", "auto") or "auto").strip().lower()
 
     for start in range(0, len(unique), batch_size):
         batch = unique[start : start + batch_size]
-        use_fallback = _load_maigret() is None
+        if mode == "http":
+            # Forced fallback: useful for a fast smoke test or a blocked network.
+            use_fallback = True
+        else:
+            use_fallback = _load_maigret() is None
 
         if use_fallback:
             tasks = [_http_fallback_one(username) for username in batch]

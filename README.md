@@ -40,7 +40,11 @@ send `/start`, and send `/trace` to run a search. `/cancel` resets the
 conversation, and `/skip` is accepted at the company step.
 
 A `.env` file is not read automatically; export the variables in your shell or
-inject them from your platform's secret store.
+inject them from your platform's secret store. Phone normalization accepts
+Nigerian (+234) numbers only. `SEARCH_MODE` accepts `auto` (the default: Maigret,
+falling back to the curated HTTP checks if Maigret cannot load) or `http`
+(always use the curated checks; useful for a fast smoke test or a network
+where Maigret's sites block the host).
 
 ## Dependency pins
 
@@ -79,6 +83,8 @@ webhook and no inbound traffic.
 - No LLM API calls in V1. Scoring is deterministic and reproducible.
 - Secrets come only from environment variables. `.env`, `*.db` and
   `__pycache__` are git-ignored, and `.env.example` contains placeholders only.
+- The Docker build excludes `.env`, `*.db`, `.venv` and `.git` through
+  `.dockerignore`, and copies only the runtime modules into the image.
 - Each search is written to a local SQLite audit log with the collector's
   Telegram ID, the subject details and the reported matches.
 
@@ -91,4 +97,12 @@ the handle or profile text, cross-platform username reuse, and any location or
 company evidence available. Gender and location signals are wired into the
 scorer but frequently receive no data in V1. Treat a dossier as a set of leads
 to verify manually, not as proof of identity; the bot intentionally stops short
-of contacting anyone.
+of contacting anyone. Handles are tokenized on dots/underscores and checked for
+packed name tokens, and an exact phone-number handle is scored as a strong
+signal, so a normal full-name trace can report leads rather than always coming
+back empty.
+
+The HTTP fallback does not check Instagram: logged-out Instagram serves a login
+page that cannot reliably distinguish a real profile, so it is skipped rather
+than reported as a match. Maigret still checks Instagram. Phone numbers must be
+Nigerian (+234).

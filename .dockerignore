@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.db
+.venv
+venv
+__pycache__
+*.pyc
+*.log
+AUDIT.md
+.verify
