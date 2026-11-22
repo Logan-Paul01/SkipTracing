@@ -118,13 +118,22 @@ def score_hit(hit: dict, profile: dict, input_ctx: dict) -> dict:
     # A claimed public profile is a weak lead on its own. Without this an
     # exact name handle scored 30 and was always discarded by the 40 threshold.
     score += 10
-    reasons.append("Public profile exists")
+    if hit.get("source") in {"exa", "tavily"}:
+        reasons.append("Public web page found")
+    else:
+        reasons.append("Public profile exists")
 
     display_name = profile.get("display_name") or hit.get("username") or ""
     similarity = _name_similarity(input_ctx.get("name"), display_name)
     if similarity > 0:
         score += similarity * 30
         reasons.append(f"Name similarity {int(round(similarity * 100))}%")
+
+    if hit.get("source") in {"exa", "tavily"} and similarity < config.WEB_MIN_NAME_SIMILARITY:
+        # Search engines happily return docs, blogs and data lists that quote
+        # the phone number. Unless the page also resembles the name, it is not
+        # a lead about this person.
+        return {"score": 0, "reasons": reasons + ["Page does not match the name"]}
 
     phone_variants = input_ctx.get("phone_variants") or ()
     username_digits = re.sub(r"\D", "", str(hit.get("username") or ""))

@@ -1,7 +1,8 @@
 """SkipTrace V1 Telegram bot.
 
 Headless, long-polling, synchronous telebot handlers around an async
-search pipeline. No web server, no webhook, no LLM calls.
+search pipeline. No web server and no webhook. The web path asks Tavily or
+Exa for a grounded, cited answer; Maigret is only the fallback.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import names
 import normalizer
 import scorer
 import searcher
+import websearch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -237,20 +239,43 @@ async def run_search(uid, user_input) -> tuple[str, list[dict]]:
 
     e164, phone_variants, meta = normalizer.normalize_phone(user_input.get("phone"))
     usernames = names.generate_usernames(name, phone_variants)
-    hits = await searcher.search_usernames(usernames)
 
-    # V1 limitation: Maigret confirms profile existence, but bio fields are
-    # not reliably extracted. Display name falls back to the handle.
-    profiles_by_url = {
-        hit["url"]: {
-            "display_name": hit.get("username", ""),
-            "bio": "",
-            "location": "",
-            "gender": "",
+    mode = (config.SEARCH_MODE or "auto").strip().lower()
+    answer = ""
+    web_hits = 0
+
+    if mode in ("auto", "web") and websearch.provider() is not None:
+        # Fast path: a real web search returns pages plus a grounded answer in
+        # seconds. Fall through to Maigret only if it finds nothing at all.
+        hits, answer = await websearch.search_subject(name, company, phone_variants)
+        web_hits = len(hits)
+        profiles_by_url = {
+            hit["url"]: {
+                "display_name": hit.get("title", ""),
+                "bio": hit.get("snippet", ""),
+                "location": "",
+                "gender": "",
+            }
+            for hit in hits
+            if hit.get("url")
         }
-        for hit in hits
-        if hit.get("url")
-    }
+    else:
+        hits = []
+
+    if not hits:
+        hits = await searcher.search_usernames(usernames)
+        # V1 limitation: Maigret confirms profile existence, but bio fields are
+        # not reliably extracted. Display name falls back to the handle.
+        profiles_by_url = {
+            hit["url"]: {
+                "display_name": hit.get("username", ""),
+                "bio": "",
+                "location": "",
+                "gender": "",
+            }
+            for hit in hits
+            if hit.get("url")
+        }
 
     input_ctx = {
         "name": name,
@@ -279,7 +304,13 @@ async def run_search(uid, user_input) -> tuple[str, list[dict]]:
         logger.warning("Audit log write failed", exc_info=True)
 
     dossier = formatter.format_dossier(
-        input_ctx, matches, len(usernames), telegram_username
+        input_ctx,
+        matches,
+        len(usernames),
+        telegram_username,
+        answer=answer,
+        sources_count=web_hits or None,
+        hits=hits,
     )
     return dossier, matches
 
@@ -296,9 +327,13 @@ def _run_and_reply(message, state) -> None:
         "username": getattr(message.from_user, "username", "") or "",
     }
 
-    bot.send_message(
-        chat_id, "🔎 Searching public profiles… this can take a few minutes."
-    )
+    fast = (config.SEARCH_MODE or "auto").strip().lower() in ("auto", "web")
+    if fast and websearch.provider() is not None:
+        bot.send_message(chat_id, "🔎 Searching the web… this usually takes seconds.")
+    else:
+        bot.send_message(
+            chat_id, "🔎 Searching public profiles… this can take a few minutes."
+        )
 
     try:
         dossier, _matches = asyncio.run(run_search(uid, payload))

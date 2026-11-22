@@ -1,20 +1,30 @@
-"""Telegram HTML dossier formatting."""
+"""Telegram HTML dossier formatting.
+
+Layout, in the order a collector reads a lead:
+
+    header      subject, phone, gender, company, audit line
+    answer      what the sources say, in one paragraph
+    contact     the subject's phone, WhatsApp, email and profile links
+    company     what the company does, where it is, how to reach it
+    matches     ranked public profiles with their evidence
+"""
 
 from __future__ import annotations
 
 import html
+import re
 from datetime import datetime, timezone
 
-MAX_MATCHES = 10
+import extract
+
+MAX_MATCHES = 8
+MATCHES_WITH_STRUCTURE = 3
 BIO_LIMIT = 200
+SNIPPET_LIMIT = 180
+ANSWER_LIMIT = 700
+TEXT_LIMIT = 3900
 MEDALS = ("🥇", "🥈", "🥉")
-
-
-def _mask_phone(phone) -> str:
-    value = str(phone or "").strip()
-    if len(value) <= 7:
-        return value
-    return f"{value[:4]}•••{value[-3:]}"
+NOT_FOUND = "not found in public sources"
 
 
 def _clip(value, limit: int = BIO_LIMIT) -> str:
@@ -22,6 +32,21 @@ def _clip(value, limit: int = BIO_LIMIT) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
+
+
+def _clip_sentence(value, limit: int) -> str:
+    """Clip prose at a sentence end so the answer never stops mid-word."""
+    text = " ".join(str(value or "").split())
+    # Grounded answers carry citation markers like [1][3]; the sources are
+    # listed below, so the markers only add clutter here.
+    text = re.sub(r"\s*\[\d+\]", "", text)
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    cut = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
+    if cut > limit // 2:
+        return window[: cut + 1]
+    return window.rsplit(" ", 1)[0].rstrip(",;:") + "…"
 
 
 def _next_action(matches: list[dict]) -> str:
@@ -38,54 +63,204 @@ def _next_action(matches: list[dict]) -> str:
     return "manually review the top match before acting"
 
 
-def format_dossier(input_ctx, matches, variations_count, telegram_username) -> str:
-    """Render the dossier as Telegram-safe HTML."""
-    input_ctx = input_ctx or {}
-    matches = list(matches or [])[:MAX_MATCHES]
+def _link(label: str, url: str) -> str:
+    safe_url = html.escape(str(url or ""), quote=True)
+    return f'<b>{html.escape(label)}:</b> <a href="{safe_url}">{html.escape(str(url or ""))}</a>'
 
-    name = html.escape(str(input_ctx.get("name") or "Unknown"))
-    phone = html.escape(_mask_phone(input_ctx.get("phone_e164")))
-    gender = html.escape(str(input_ctx.get("gender") or "Not stated"))
-    company = html.escape(str(input_ctx.get("company") or "").strip() or "—")
-    searched_by = html.escape(str(telegram_username or "unknown").lstrip("@"))
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    lines = [
-        "🔎 <b>SKIPTRACE DOSSIER</b>",
-        f"<b>Subject:</b> {name} · {phone} · {gender} · {company}",
-        f"<b>Audit:</b> searched by @{searched_by} · {timestamp}",
-        f"<b>Variations tested:</b> {int(variations_count or 0)} usernames",
-        "",
-    ]
+def _social_lines(socials: dict[str, list[str]]) -> list[str]:
+    """One line per platform, in the order collectors look for them."""
+    order = ("LinkedIn", "Facebook", "Instagram", "X", "TikTok")
+    lines = []
+    for label in order:
+        urls = socials.get(label) or []
+        if not urls:
+            continue
+        # Two links per platform is enough to reach the subject; more would
+        # eat the space the ranked evidence needs.
+        for url in urls[:2]:
+            lines.append(f'<b>{html.escape(label)}:</b> <a href="{html.escape(url, quote=True)}">{html.escape(url)}</a>')
+    for label, urls in socials.items():
+        if label in order or not urls:
+            continue
+        lines.append(_link(label, urls[0]))
+    return lines
 
-    if not matches:
-        lines.append("No public profiles cleared the confidence threshold.")
+
+def _contact_block(person: dict) -> list[str]:
+    lines = ["📇 <b>Contact details</b>"]
+
+    phones = person.get("phones") or []
+    if phones:
+        lines.extend(f"<b>Phone:</b> {html.escape(number)}" for number in phones[:2])
+    else:
+        lines.append(f"<b>Phone:</b> {NOT_FOUND}")
+
+    if person.get("whatsapp"):
+        lines.extend(
+            f"<b>WhatsApp:</b> {html.escape(number)}" for number in person["whatsapp"]
+        )
+
+    emails = person.get("emails") or []
+    if emails:
+        lines.extend(f"<b>Email:</b> {html.escape(address)}" for address in emails[:2])
+    else:
+        lines.append(f"<b>Email:</b> {NOT_FOUND}")
+
+    social_lines = _social_lines(person.get("socials") or {})
+    if social_lines:
+        lines.extend(social_lines)
+    else:
+        lines.append("<b>Social profiles:</b> not found in public sources")
+
+    lines.append("")
+    return lines
+
+
+def _company_block(company: dict) -> list[str]:
+    lines = ["🏢 <b>Company details</b>"]
+
+    if not company.get("name"):
+        lines.append("No company supplied and none named in the sources.")
         lines.append("")
+        return lines
 
-    for index, match in enumerate(matches):
+    lines.append(f"<b>Company:</b> {html.escape(company['name'])}")
+
+    if company.get("about"):
+        lines.append(f"<b>About:</b> {html.escape(company['about'])}")
+
+    if company.get("website"):
+        host = company["website"]
+        lines.append(_link("Website", host if host.startswith("http") else f"https://{host}"))
+
+    if company.get("address"):
+        lines.append(f"<b>Address:</b> {html.escape(company['address'])}")
+
+    for label in ("phones", "emails"):
+        values = company.get(label) or []
+        if not values:
+            continue
+        for value in values[:3]:
+            name = "Phone" if label == "phones" else "Email"
+            lines.append(f"<b>{name}:</b> {html.escape(value)}")
+
+    social_lines = _social_lines(company.get("socials") or {})
+    if social_lines:
+        lines.extend(social_lines)
+
+    lines.append("")
+    return lines
+
+
+def _match_blocks(matches: list[dict], limit: int) -> list[list[str]]:
+    blocks: list[list[str]] = []
+    for index, match in enumerate(matches[:limit]):
         medal = MEDALS[index] if index < len(MEDALS) else "▪️"
         site = html.escape(str(match.get("site") or "Unknown site"))
         score = int(match.get("score") or 0)
         display_name = html.escape(str(match.get("display_name") or match.get("username") or ""))
         url = html.escape(str(match.get("url") or ""), quote=True)
 
-        lines.append(f"{medal} <b>{site} — {score}/100</b>")
+        block = [f"{medal} <b>{site} — {score}/100</b>"]
         if display_name:
-            lines.append(display_name)
+            block.append(display_name)
 
-        bio = _clip(match.get("bio"))
+        bio = _clip(match.get("snippet"), SNIPPET_LIMIT) if match.get("snippet") else _clip(match.get("bio"))
         if bio:
-            lines.append(f"“{html.escape(bio)}”")
+            block.append(f"“{html.escape(bio)}”")
 
         if url:
-            link_text = html.escape(str(match.get("url") or ""))
-            lines.append(f'<a href="{url}">{link_text}</a>')
+            block.append(f'<a href="{url}">{html.escape(str(match.get("url") or ""))}</a>')
 
         reasons = [html.escape(str(reason)) for reason in (match.get("reasons") or [])]
         if reasons:
-            lines.append("✔ " + " · ".join(reasons))
+            block.append("✔ " + " · ".join(reasons))
 
-        lines.append("")
+        block.append("")
+        blocks.append(block)
+    return blocks
 
-    lines.append(f"<b>Suggested next action:</b> {html.escape(_next_action(matches))}")
-    return "\n".join(lines)
+
+def format_dossier(
+    input_ctx,
+    matches,
+    variations_count,
+    telegram_username,
+    answer: str = "",
+    sources_count=None,
+    hits=(),
+) -> str:
+    """Render the dossier as Telegram-safe HTML."""
+    input_ctx = input_ctx or {}
+    matches = list(matches or [])
+    structured = extract.collect(input_ctx, answer, hits)
+
+    name = html.escape(str(input_ctx.get("name") or "Unknown"))
+    # Collectors need the full number to dial it, so it is never masked here.
+    phone = html.escape(str(input_ctx.get("phone_e164") or "").strip() or NOT_FOUND)
+    gender = html.escape(str(input_ctx.get("gender") or "Not stated"))
+    company_name = html.escape(
+        str(input_ctx.get("company") or "").strip()
+        or structured["company"].get("name")
+        or "not supplied"
+    )
+    searched_by = html.escape(str(telegram_username or "unknown").lstrip("@"))
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    head = [
+        "🔎 <b>SKIPTRACE DOSSIER</b>",
+        f"<b>Subject:</b> {name}",
+        f"<b>Phone number:</b> {phone}",
+        f"<b>Gender:</b> {gender}",
+        f"<b>Company:</b> {company_name}",
+        f"<b>Audit:</b> searched by @{searched_by} at {timestamp}",
+    ]
+    if sources_count:
+        head.append(f"<b>Sources scanned:</b> {int(sources_count)} public pages")
+    else:
+        head.append(f"<b>Variations tested:</b> {int(variations_count or 0)} usernames")
+    head.append("")
+
+    body: list[str] = list(head)
+
+    if answer:
+        body.append("🧠 <b>What the sources say</b>")
+        body.append(html.escape(_clip_sentence(answer, ANSWER_LIMIT)))
+        body.append("")
+
+    body.extend(_contact_block(structured["person"]))
+
+    if answer or hits:
+        body.extend(_company_block(structured["company"]))
+    else:
+        body.append("🏢 <b>Company details</b>")
+        body.append("No company supplied and the profile search found none.")
+        body.append("")
+
+    if structured["person"].get("phones") or structured["company"].get("website"):
+        limit = MATCHES_WITH_STRUCTURE
+    else:
+        limit = MAX_MATCHES
+
+    match_blocks = _match_blocks(matches, limit)
+    if match_blocks:
+        body.append("🏅 <b>Top matching profiles</b>")
+        body.append("")
+
+    tail = [f"<b>Suggested next action:</b> {html.escape(_next_action(matches))}"]
+
+    def render(blocks: list[list[str]]) -> str:
+        lines: list[str] = list(body)
+        for block in blocks:
+            lines.extend(block)
+        lines.extend(tail)
+        return "\n".join(lines)
+
+    text = render(match_blocks)
+    # Telegram rejects anything over 4,096 characters. Drop whole profile
+    # blocks from the bottom rather than slicing HTML mid-tag.
+    while match_blocks and len(text) > TEXT_LIMIT:
+        match_blocks.pop()
+        text = render(match_blocks)
+    return text

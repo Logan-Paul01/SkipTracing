@@ -41,10 +41,28 @@ conversation, and `/skip` is accepted at the company step.
 
 A `.env` file is not read automatically; export the variables in your shell or
 inject them from your platform's secret store. Phone normalization accepts
-Nigerian (+234) numbers only. `SEARCH_MODE` accepts `auto` (the default: Maigret,
-falling back to the curated HTTP checks if Maigret cannot load) or `http`
-(always use the curated checks; useful for a fast smoke test or a network
-where Maigret's sites block the host).
+Nigerian (+234) numbers only.
+
+### Search modes and speed
+
+Set `TAVILY_API_KEY` or `EXA_API_KEY` (Tavily wins if both are set) and
+`SEARCH_MODE=auto` — the default — runs a real web search plus a grounded,
+answer-with-citations step. A full trace then finishes in about 1.5 seconds,
+returning the sources behind every claim. This replaced Maigret as the default
+because Maigret walks ~3,500 sites per username: with 25 generated usernames
+that is roughly 89,000 requests, measured at 4-5 hours per trace on this host.
+
+`SEARCH_MODE` accepts:
+
+- `auto` / `web` — Tavily or Exa when a key is present, Maigret otherwise.
+- `maigret` — force the Maigret username walk (slow, but no search API key).
+- `http` — force the curated HTTP checks (TikTok, Facebook, LinkedIn, GitHub,
+  Nairaland); a fast smoke test, or a network where Maigret's sites block the
+  host.
+
+A web page only becomes a lead if it also resembles the subject's name
+(`WEB_MIN_NAME_SIMILARITY`). Without that floor, tutorials and blog posts that
+merely quote the debtor's phone number outrank the person's real profile.
 
 ## Dependency pins
 
@@ -80,7 +98,11 @@ webhook and no inbound traffic.
   no credential handling beyond `BOT_TOKEN`.
 - No auto-calling and no auto-messaging. The dossier only reports links; any
   contact is a human decision made outside the bot.
-- No LLM API calls in V1. Scoring is deterministic and reproducible.
+- No LLM calls from the bot's own code, and scoring is deterministic and
+  reproducible. The prose under "What the sources say" comes from the search
+  provider's grounded-answer endpoint (Tavily or Exa), generated only over the
+  pages it just retrieved, and every claim in it links back to a listed source.
+  It is a summary of search evidence, not proof of identity.
 - Secrets come only from environment variables. `.env`, `*.db` and
   `__pycache__` are git-ignored, and `.env.example` contains placeholders only.
 - The Docker build excludes `.env`, `*.db`, `.venv` and `.git` through
