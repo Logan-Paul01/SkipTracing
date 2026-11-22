@@ -40,7 +40,8 @@ handful of curated public-profile checks.
 | `extract.py` | Structured person/company fields pulled from the answer, the pages and the company site |
 | `scorer.py` | Auditable per-page confidence score and the report threshold |
 | `formatter.py` | Dossier layout, clipping and length trimming |
-| `db.py` | SQLite audit log (`searches`, `matches`) |
+| `access.py` | Free-search allowance, paywall, payment seam, `/broadcast` owner |
+| `db.py` | SQLite audit log (`searches`, `matches`), accounts (`users`), `meta` |
 
 ## Dossier layout
 
@@ -81,6 +82,45 @@ Suggested next action: one line derived from the top match's reasons
 
 The message is capped at 3,900 characters: if it overruns, whole profile blocks
 are dropped from the bottom rather than slicing HTML mid-tag.
+
+## Free searches and payment
+
+Every account gets **5 free searches**, then a dossier costs **₦200**.
+`FREE_SEARCHES` and `PRICE_PER_SEARCH_NGN` change both numbers without a code
+change.
+
+- The allowance is checked when `/trace` starts, so nobody fills in four steps
+  for a search they cannot run.
+- A search is charged only after its dossier has been delivered: a failed
+  search costs nothing.
+- Each dossier is followed by one short receipt line (`🎟 4 of 5 free searches
+  left.`).
+- **No payment provider is connected yet.** The paywall says so. When one is
+  added, `access.grant_searches(telegram_id, count)` is the only call needed
+  after a confirmed payment; the existing quota logic spends the credits.
+  Top-ups can be applied by hand:
+  `python3 -c "import db; db.init_db(); db.grant_searches(123456789, 5)"`.
+
+The account table also carries `plan` and `plan_expires_at` columns, so a
+subscription can be attached later without touching the search pipeline.
+
+## Operator broadcast
+
+`/broadcast` messages every account that has ever used the bot. It is hidden:
+absent from `/start`, from the help text and from the BotFather command menu, and
+unknown to any account that does not own it.
+
+- `/broadcast <text>` sends immediately; `/broadcast` alone asks for the body in
+  the next message, so multi-line announcements work. `/cancel` aborts.
+- Messages go out prefixed with `📢 SkipTrace update`; HTML is allowed.
+- Sends are spaced ~20/s, pause on Telegram's flood error, and report
+  `Delivered`/`Failed` counts.
+- Ownership needs no Telegram ID: the first account to send `/broadcast` claims
+  it and it is stored in the database. Set `OWNER_ID` instead to lock the
+  command to a known account. The owner is also exempt from the search quota.
+
+`MANUAL.md` is the handover document: data model, allowance flow, broadcast
+ownership, checks, deployment and open decisions.
 
 ## Search engine: Exa + Tavily
 
@@ -220,9 +260,13 @@ python bot.py
 Create the bot with [@BotFather](https://t.me/BotFather). Then open a chat with
 it, send `/start`, and send `/trace` to run a search:
 
+- `/start` — welcome text and the free-search allowance
 - `/trace` — start a trace (name → phone → gender → company)
 - `/skip` — accept an empty company at step 4
-- `/cancel` — reset the conversation
+- `/cancel` — reset the conversation (also stops a `/broadcast` draft)
+
+`/broadcast` exists but is deliberately undocumented in the bot: see
+[Operator broadcast](#operator-broadcast).
 
 A `.env` file is read automatically if it sits next to `bot.py` (git-ignored,
 loaded at import, never overriding a variable that is already exported):
@@ -247,6 +291,9 @@ EXA_API_KEY=your_exa_key
 | `ENV_FILE` | `.env` | Path read for keys when they are not exported |
 | `EXA_API_KEY` | — | Enables the Exa engine |
 | `TAVILY_API_KEY` | — | Enables the Tavily engine (used instead of Exa when both are set) |
+| `FREE_SEARCHES` | `5` | Free dossiers per account |
+| `PRICE_PER_SEARCH_NGN` | `200` | Price shown in the paywall (no payment provider yet) |
+| `OWNER_ID` | — | Optional: locks `/broadcast` to one account |
 
 Tuning constants live in `config.py`: `WEB_MAX_RESULTS=8`,
 `WEB_HIGHLIGHT_CHARS=600`, `WEB_SEARCH_TIMEOUT=12`,

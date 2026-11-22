@@ -8,6 +8,14 @@ configuration to disk.
 import os
 
 
+def _int_env(name: str, default: int) -> int:
+    """A whole number from the environment, never crashing on a bad value."""
+    try:
+        return int(str(os.environ.get(name, "")).strip() or default)
+    except ValueError:
+        return default
+
+
 def _load_dotenv(path: str) -> None:
     """Load KEY=VALUE lines from an optional .env file.
 
@@ -46,6 +54,16 @@ BOT_TOKEN = (
 
 # SQLite audit log location.
 DB_PATH = os.environ.get("DB_PATH", "skiptrace.db")
+
+# Free dossiers per account before the bot asks for payment. PRICE is only the
+# number printed in the paywall: no payment provider is connected yet.
+FREE_SEARCHES = max(0, _int_env("FREE_SEARCHES", 5))
+PRICE_PER_SEARCH_NGN = max(0, _int_env("PRICE_PER_SEARCH_NGN", 200))
+
+# Optional pin for the hidden /broadcast command. When it is empty the first
+# account to send /broadcast claims ownership, so no Telegram ID has to be
+# configured anywhere. Set it only to lock the command to a known account.
+OWNER_ID = os.environ.get("OWNER_ID", "").strip()
 
 # "auto"/"web" uses Tavily or Exa when a key is set, and the curated profile
 # checks when it is not. "http" forces the curated checks: a fast smoke test,

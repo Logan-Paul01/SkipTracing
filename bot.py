@@ -13,11 +13,13 @@ import html
 import logging
 import re
 import sys
+import time
 
 import telebot
 from telebot.apihelper import ApiTelegramException
 from telebot.types import ReplyKeyboardMarkup, ReplyKeyboardRemove
 
+import access
 import config
 import db
 import formatter
@@ -52,12 +54,14 @@ WELCOME_TEXT = (
     "2. Phone number\n"
     "3. Gender\n"
     "4. Company (optional)\n\n"
+    f"{access.welcome_line()}\n\n"
     "Only public profiles are searched. The bot never messages or calls "
     "anyone.\n"
     "/cancel stops the current trace."
 )
 
 TEXT_LIMIT = 4000
+UNKNOWN_COMMAND = "Unknown command. Send /trace to start a search or /cancel to stop."
 
 
 def _new_state() -> dict:
@@ -107,7 +111,9 @@ def _send_html(chat_id: int, text: str) -> None:
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
-    _reset(message.from_user.id)
+    uid = message.from_user.id
+    _reset(uid)
+    db.touch_user(uid, getattr(message.from_user, "username", "") or "")
     bot.send_message(message.chat.id, WELCOME_TEXT, parse_mode="HTML")
 
 
@@ -123,8 +129,15 @@ def cmd_cancel(message):
 
 @bot.message_handler(commands=["trace"])
 def cmd_trace(message):
-    STATE[message.from_user.id] = _new_state()
-    STATE[message.from_user.id]["step"] = "name"
+    uid = message.from_user.id
+    db.touch_user(uid, getattr(message.from_user, "username", "") or "")
+    # Checked here, before four steps are collected, so a user never fills in a
+    # whole form only to be told they cannot run it.
+    if not access.can_search(uid):
+        bot.send_message(message.chat.id, access.paywall(uid), parse_mode="HTML")
+        return
+    STATE[uid] = _new_state()
+    STATE[uid]["step"] = "name"
     bot.send_message(
         message.chat.id,
         "Step 1/4 — Send the debtor's <b>full name</b> (first and surname).",
@@ -147,17 +160,108 @@ def cmd_skip(message):
     _run_and_reply(message, state)
 
 
+def _broadcast(chat_id: int, owner_id: int, body: str) -> None:
+    """Send one message to every account that has ever used the bot."""
+    recipients = db.all_users()
+    if not recipients:
+        bot.send_message(chat_id, "📣 No one has used the bot yet, so there is nobody to broadcast to.")
+        return
+
+    notice = bot.send_message(
+        chat_id, f"📣 Broadcasting to {len(recipients)} users…"
+    )
+    # A fixed header keeps an operator message recognisable in a chat list.
+    text = f"<b>📢 SkipTrace update</b>\n\n{body}"
+    sent = 0
+    failed = 0
+
+    for index, account in enumerate(recipients, start=1):
+        recipient = account.get("telegram_id")
+        try:
+            _send_html(int(recipient), text)
+            sent += 1
+        except ApiTelegramException as exc:
+            failed += 1
+            if getattr(exc, "error_code", None) == 429:
+                # Telegram's flood limit: wait it out instead of dropping the
+                # rest of the list.
+                time.sleep(3)
+        except Exception:  # noqa: BLE001 - one bad chat must not stop the run
+            failed += 1
+            logger.warning("Broadcast failed for telegram_id=%s", recipient)
+
+        # ~20 messages a second, below Telegram's ~30/s ceiling.
+        time.sleep(0.05)
+        if index % 25 == 0:
+            try:
+                bot.edit_message_text(
+                    f"📣 Broadcasting… {index}/{len(recipients)}",
+                    chat_id,
+                    notice.message_id,
+                )
+            except Exception:  # noqa: BLE001 - progress text is cosmetic
+                pass
+
+    summary = (
+        f"✅ Broadcast finished.\n"
+        f"Delivered: {sent}\n"
+        f"Failed: {failed}"
+    )
+    try:
+        bot.edit_message_text(summary, chat_id, notice.message_id)
+    except Exception:  # noqa: BLE001 - fall back to a fresh message
+        bot.send_message(chat_id, summary)
+    logger.info("Broadcast by telegram_id=%s: %s sent, %s failed", owner_id, sent, failed)
+
+
+@bot.message_handler(commands=["broadcast"])
+def cmd_broadcast(message):
+    """Hidden operator command: message every account.
+
+    It is deliberately absent from /start and from the command menu. Only the
+    owner gets a reply; anyone else sees the ordinary unknown-command text, so
+    the command name reveals nothing to a user who stumbles on it.
+    """
+    uid = message.from_user.id
+    if not access.is_owner(uid):
+        if not access.claim_owner(uid):
+            bot.send_message(message.chat.id, UNKNOWN_COMMAND)
+            return
+        logger.info("Broadcast ownership claimed by telegram_id=%s", uid)
+
+    _reset(uid)
+    db.touch_user(uid, getattr(message.from_user, "username", "") or "")
+
+    parts = (message.text or "").split(maxsplit=1)
+    body = parts[1].strip() if len(parts) > 1 else ""
+    if body:
+        _broadcast(message.chat.id, uid, body)
+        return
+
+    STATE[uid] = _new_state()
+    STATE[uid]["step"] = "broadcast"
+    bot.send_message(
+        message.chat.id,
+        "📣 <b>Broadcast</b>\nSend the message to deliver to every user "
+        "(HTML is allowed), or /cancel to stop.",
+        parse_mode="HTML",
+    )
+
+
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
     uid = message.from_user.id
     state = STATE.get(uid)
     text = (message.text or "").strip()
+    db.touch_user(uid, getattr(message.from_user, "username", "") or "")
 
     if text.startswith("/"):
-        bot.send_message(
-            message.chat.id,
-            "Unknown command. Send /trace to start a search or /cancel to stop.",
-        )
+        bot.send_message(message.chat.id, UNKNOWN_COMMAND)
+        return
+
+    if state and state.get("step") == "broadcast" and access.is_owner(uid):
+        _reset(uid)
+        _broadcast(message.chat.id, uid, text)
         return
 
     if not state or state.get("step") in (None, "idle"):
@@ -349,6 +453,16 @@ def _run_and_reply(message, state) -> None:
         return
 
     _send_html(chat_id, dossier)
+
+    # Charged only once the dossier has actually gone out, so a failed search
+    # never costs the collector a paid search.
+    try:
+        access.charge(uid)
+        note = access.receipt(uid)
+        if note:
+            bot.send_message(chat_id, note)
+    except Exception:  # noqa: BLE001 - billing must never break a trace
+        logger.warning("Search allowance update failed", exc_info=True)
 
 
 def main() -> None:
