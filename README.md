@@ -8,6 +8,11 @@ contact and company fields out of the evidence it finds, scores every page
 deterministically, and replies with one HTML dossier. It runs on long polling,
 writes an audit log to SQLite, and never calls or messages the debtor.
 
+Search is a real web-search API — **Exa** or **Tavily** — which returns live
+pages plus a grounded, cited answer in a couple of seconds. Maigret is not the
+engine and is not part of a normal trace; it survives only as an optional
+legacy fallback for a host with no search key.
+
 ## How a trace runs
 
 ```
@@ -29,8 +34,8 @@ writes an audit log to SQLite, and never calls or messages the debtor.
 | `config.py` | All runtime settings, read from environment variables only |
 | `normalizer.py` | Nigerian phone parsing; returns E.164, digit variants and carrier/region metadata |
 | `names.py` | Orthographic rules plus soundex/metaphone/nysiis to derive candidate handles |
-| `websearch.py` | Tavily/Exa search, grounded-answer prompt, direct company-site fetch |
-| `searcher.py` | Maigret walk and the curated HTTP checks, used as the fallback |
+| `websearch.py` | **The search engine**: Exa and Tavily queries, grounded-answer prompt, direct company-site fetch |
+| `searcher.py` | Legacy fallback only — optional Maigret walk and the curated HTTP checks, reached when no search key is configured or the web search returns nothing |
 | `extract.py` | Structured person/company fields pulled from the answer, the pages and the company site |
 | `scorer.py` | Auditable per-page confidence score and the report threshold |
 | `formatter.py` | Dossier layout, clipping and length trimming |
@@ -76,25 +81,36 @@ Suggested next action: one line derived from the top match's reasons
 The message is capped at 3,900 characters: if it overruns, whole profile blocks
 are dropped from the bottom rather than slicing HTML mid-tag.
 
-## Search modes and speed
+## Search engine: Exa + Tavily
 
-Set `TAVILY_API_KEY` or `EXA_API_KEY` (Tavily wins when both are set) and
-`SEARCH_MODE=auto` — the default — runs concurrent web searches plus the
-provider's grounded, cited answer. On a worked case (name + company) a full
-trace finishes in roughly 3-4 seconds including the company-site fetch.
+The engine is a real web-search API, not a username walker. With
+`EXA_API_KEY` or `TAVILY_API_KEY` set, every trace fires several search queries
+plus one grounded-answer prompt in parallel and gets back live pages with
+extracted text and a cited summary. A full trace (name + company) finishes in
+roughly 3-4 seconds including the company-site fetch.
 
-This replaced Maigret as the default because Maigret walks ~3,500 sites per
-username; with up to 25 generated usernames that is ~89,000 requests, measured
-at 4-5 hours per trace on this host.
+Which provider runs:
 
-`SEARCH_MODE` accepts:
+- both keys set → **Tavily** (pages and the grounded answer come back in one request)
+- only `EXA_API_KEY` set → **Exa** (`/search` for pages, `/answer` for the cited summary) — the provider in use wherever only the Exa key is configured
+- neither key set → the legacy fallback below
 
-- `auto` / `web` — Tavily or Exa when a key is present, Maigret otherwise. If
-  the web search returns no usable pages at all, the run falls back to Maigret.
-- `maigret` — skip the web search entirely and walk Maigret.
-- `http` — force the curated checks only (TikTok, Facebook, LinkedIn, GitHub,
-  Nairaland); a fast smoke test, or a network where Maigret's sites block the
-  host.
+`SEARCH_MODE` defaults to `auto` / `web`, which means the Exa/Tavily web search.
+It also accepts `maigret` and `http`, which force the legacy paths.
+
+### Legacy fallback (not used in normal operation)
+
+`searcher.py` keeps two non-web paths for hosts with no search key and for
+smoke tests. Neither is part of the Exa/Tavily pipeline:
+
+- `maigret` — the classic username walk over ~3,500 sites per handle. With up
+to 25 generated usernames that is ~89,000 requests, measured at 4-5 hours per
+trace on this host. This is exactly why it is no longer the default.
+- `http` — five curated public sites (TikTok, Facebook, LinkedIn, GitHub,
+Nairaland) in a few seconds; useful on a blocked network.
+
+The web path only drops to Maigret if no key is configured at all, or if every
+query comes back with zero pages.
 
 ### The queries
 
@@ -219,9 +235,9 @@ defaults to `skiptrace.db`.
 | `BOT_TOKEN` | — | BotFather token (required) |
 | `Skiptracingbotkey` | — | Accepted fallback for `BOT_TOKEN` |
 | `DB_PATH` | `skiptrace.db` | SQLite audit log |
-| `SEARCH_MODE` | `auto` | `auto`/`web`, `maigret`, `http` |
-| `TAVILY_API_KEY` | — | Enables Tavily (preferred) |
-| `EXA_API_KEY` | — | Enables Exa |
+| `SEARCH_MODE` | `auto` | `auto`/`web` (Exa/Tavily engine), or the legacy `maigret` / `http` |
+| `EXA_API_KEY` | — | Enables the Exa engine |
+| `TAVILY_API_KEY` | — | Enables the Tavily engine (used instead of Exa when both are set) |
 
 Tuning constants live in `config.py`: `WEB_MAX_RESULTS=8`,
 `WEB_HIGHLIGHT_CHARS=600`, `WEB_SEARCH_TIMEOUT=12`,
@@ -274,8 +290,9 @@ expansions, plus soundex, metaphone and nysiis agreement) covers that noise
 cheaply and identically on every run, and every point in a dossier traces back
 to a named rule — which matters when a collector has to justify an action. An
 LLM would invent handles that do not exist, vary between identical inputs, and
-blur the audit trail. This still governs the Maigret fallback, which searches by
-handle; the web path matches on page titles and URLs instead.
+blur the audit trail. This governs only the legacy Maigret fallback, which
+searches by handle; the Exa/Tavily path matches on page titles, snippets and
+URLs instead, so handle variation no longer decides a lead.
 
 ## Dependency pins
 
@@ -296,5 +313,5 @@ headless long-polling process.
   or company email; the fetch is capped and then skipped for 10 minutes.
 - The HTTP fallback does not check Instagram: logged-out Instagram serves a
   login page that cannot reliably distinguish a real profile, so it is skipped
-  rather than reported as a match. Maigret still checks Instagram.
+  rather than reported as a match. The legacy Maigret path still checks it.
 - Phone numbers must be Nigerian (+234).
