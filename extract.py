@@ -162,9 +162,34 @@ COMPANY_STOPWORDS = {
 }
 
 
+# A grounded answer often states what it could not find; those sentences are
+# never evidence for a field.
+NEGATIVE_PHRASES = (
+    "not found",
+    "not available",
+    "not disclosed",
+    "not listed",
+    "no public",
+    "could not be found",
+    "were not",
+    "was not",
+    "unknown",
+)
+
+
+def _is_negative(sentence: str) -> bool:
+    low = sentence.lower()
+    return any(phrase in low for phrase in NEGATIVE_PHRASES)
+
+
 def _sentences(text: str) -> list[str]:
-    """Split prose into sentences, keeping bullet-style lines separate."""
-    parts = re.split(r"(?<=[.!?])\s+|\n+", str(text or ""))
+    """Split prose into sentences, keeping bullet-style lines separate.
+
+    Citation markers like ``[3]`` are dropped first: left in, they satisfy the
+    "contains a digit" checks and a citation turns into a fake street number.
+    """
+    text = re.sub(r"\s*\[\d+\]", "", str(text or ""))
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
     return [" ".join(part.split()) for part in parts if part and part.strip()]
 
 
@@ -323,6 +348,8 @@ def _pick_address(tagged: list[tuple[str, str]]) -> str:
             if kind not in allowed:
                 continue
             low = sentence.lower()
+            if _is_negative(sentence):
+                continue
             if not any(hint in low for hint in ADDRESS_HINTS):
                 continue
             if not re.search(r"\d", sentence):
@@ -346,6 +373,8 @@ def _pick_about(
         if kind not in ("answer", "site"):
             continue
         low = sentence.lower()
+        if _is_negative(sentence):
+            continue
         if address and sentence in address:
             continue
         if not any(token in low for token in company_tokens):
