@@ -85,24 +85,28 @@ are dropped from the bottom rather than slicing HTML mid-tag.
 
 ## Free searches and payment
 
-Every account gets **5 free searches**, then a dossier costs **₦200**.
-`FREE_SEARCHES` and `PRICE_PER_SEARCH_NGN` change both numbers without a code
-change.
+Every account gets **5 free searches**. After that, **SkipTrace Premium** is
+**₦200 for 30 days**, carrying up to **20 dossiers**. `FREE_SEARCHES`,
+`PLAN_PRICE_NGN`, `PLAN_SEARCHES` and `PLAN_DAYS` change those numbers without
+a code change.
 
 - The allowance is checked when `/trace` starts, so nobody fills in four steps
   for a search they cannot run.
 - A search is charged only after its dossier has been delivered: a failed
   search costs nothing.
 - Each dossier is followed by one short receipt line (`🎟 4 of 5 free searches
-  left.`).
+  left.` or `⭐ Premium · 18 of 20 searches left · renews 21 Dec.`).
+- A plan is a 30-day pass, not an auto-renewing subscription. When it lapses
+  the leftover searches go with it; a renewal starts a clean 20.
 - **No payment provider is connected yet.** The paywall says so. When one is
-  added, `access.grant_searches(telegram_id, count)` is the only call needed
-  after a confirmed payment; the existing quota logic spends the credits.
-  Top-ups can be applied by hand:
-  `python3 -c "import db; db.init_db(); db.grant_searches(123456789, 5)"`.
+  added, `access.grant_plan(telegram_id)` is the only call needed after a
+  confirmed ₦200 payment. Manual activation:
+  `python3 -c "import access; access.grant_plan(123456789)"`.
 
-The account table also carries `plan` and `plan_expires_at` columns, so a
-subscription can be attached later without touching the search pipeline.
+Why 20 rather than 50: a trace with a company is seven Exa requests (about
+$0.05, ₦70), so 50 searches would cost roughly ₦3,500 in API credits against
+₦200 of revenue. Exa's free monthly credit (about 200 company traces) carries
+the launch; 20 per plan keeps ten paying users inside it.
 
 ## Operator broadcast
 
@@ -132,8 +136,9 @@ roughly 3-4 seconds including the company-site fetch.
 
 Which provider runs:
 
-- both keys set → **Tavily** (pages and the grounded answer come back in one request)
-- only `EXA_API_KEY` set → **Exa** (`/search` for pages, `/answer` for the cited summary) — the provider in use wherever only the Exa key is configured
+- both keys set → **Exa** (cheaper per request, and more traces per free credit)
+- only `EXA_API_KEY` set → **Exa** (`/search` for pages, `/answer` for the cited summary) — the provider in use here
+- only `TAVILY_API_KEY` set → **Tavily** (pages and the grounded answer come back in one request)
 - neither key set → the curated checks below
 
 `SEARCH_MODE` defaults to `auto` / `web`, which means the Exa/Tavily web search.
@@ -290,9 +295,11 @@ EXA_API_KEY=your_exa_key
 | `SEARCH_MODE` | `auto` | `auto`/`web` (Exa/Tavily engine) or `http` (curated checks) |
 | `ENV_FILE` | `.env` | Path read for keys when they are not exported |
 | `EXA_API_KEY` | — | Enables the Exa engine |
-| `TAVILY_API_KEY` | — | Enables the Tavily engine (used instead of Exa when both are set) |
+| `TAVILY_API_KEY` | — | Enables the Tavily engine (Exa still wins when both are set) |
 | `FREE_SEARCHES` | `5` | Free dossiers per account |
-| `PRICE_PER_SEARCH_NGN` | `200` | Price shown in the paywall (no payment provider yet) |
+| `PLAN_PRICE_NGN` | `200` | Launch plan price shown in the paywall |
+| `PLAN_SEARCHES` | `20` | Dossiers included in one plan period |
+| `PLAN_DAYS` | `30` | Length of one plan period |
 | `OWNER_ID` | — | Optional: locks `/broadcast` to one account |
 
 Tuning constants live in `config.py`: `WEB_MAX_RESULTS=8`,

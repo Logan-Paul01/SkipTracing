@@ -1,23 +1,29 @@
 """Search allowance per account, and the owner of the hidden /broadcast.
 
-Every account gets ``FREE_SEARCHES`` dossiers (5 by default). After that the
-bot replies with the price and stops, because no payment provider is connected
-yet. When one is added the only integration point is
-:func:`access.grant_searches`: call it once a payment is confirmed and the next
-search is charged against that credit. Nothing in the search pipeline changes.
+Every account gets ``FREE_SEARCHES`` dossiers (5 by default). After that it
+needs SkipTrace Premium: ``PLAN_PRICE_NGN`` (₦200) for ``PLAN_DAYS`` (30) days,
+which carries ``PLAN_SEARCHES`` (20) dossiers. No payment provider is connected
+yet, so the paywall only prints those numbers.
 
-The ``plan`` / ``plan_expires_at`` columns on the account row exist so a
-subscription can be attached later; today the quota only reads
-``free_searches_used`` and ``paid_searches_left``.
+The only integration point for a payment provider is :func:`grant_plan` (or
+:func:`grant_searches` for plain credits): call it once a payment is confirmed.
+Nothing in the search pipeline changes. A plan is a 30-day pass, not an
+auto-renewing subscription, until billing exists.
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 import config
 import db
 
 FREE_SEARCHES = config.FREE_SEARCHES
-PRICE_NGN = config.PRICE_PER_SEARCH_NGN
+PLAN_PRICE_NGN = config.PLAN_PRICE_NGN
+PLAN_SEARCHES = config.PLAN_SEARCHES
+PLAN_DAYS = config.PLAN_DAYS
+
+_STAMP = "%Y-%m-%d %H:%M:%S"
 
 
 def owner_id() -> int:
@@ -48,7 +54,10 @@ def claim_owner(telegram_id) -> bool:
 
 
 def status(telegram_id) -> dict:
-    """Free searches left, paid credits left and the counters behind them."""
+    """Free searches left, plan allowance left and the period behind them."""
+    # A lapsed plan is cleared here, so last month's leftovers can never be
+    # spent in the next period.
+    db.expire_plan(telegram_id)
     user = db.get_user(telegram_id)
     used = int(user.get("free_searches_used") or 0)
     paid = int(user.get("paid_searches_left") or 0)
@@ -76,9 +85,31 @@ def charge(telegram_id) -> None:
     db.charge_search(telegram_id)
 
 
-def grant_searches(telegram_id, count: int, plan=None, days=None) -> None:
-    """Top up an account after a confirmed payment (manual for now)."""
-    db.grant_searches(telegram_id, count, plan=plan, days=days)
+def grant_plan(telegram_id, days=None) -> None:
+    """Start or renew Premium after a confirmed payment.
+
+    A renewal resets the allowance to the full plan, so the new period starts
+    clean instead of stacking last month's leftovers.
+    """
+    db.grant_searches(
+        telegram_id,
+        PLAN_SEARCHES,
+        plan="premium",
+        days=days or PLAN_DAYS,
+        reset=True,
+    )
+
+
+def grant_searches(telegram_id, count: int) -> None:
+    """Add plain search credits with no period (manual goodwill top-up)."""
+    db.grant_searches(telegram_id, count)
+
+
+def _renewal(expires) -> str:
+    try:
+        return datetime.strptime(str(expires), _STAMP).strftime("%d %b")
+    except (TypeError, ValueError):
+        return ""
 
 
 def receipt(telegram_id) -> str:
@@ -87,13 +118,21 @@ def receipt(telegram_id) -> str:
         return ""
     account = status(telegram_id)
     if account["paid_left"]:
+        if account["plan"] == "premium":
+            renews = _renewal(account.get("plan_expires_at"))
+            tail = f" · renews {renews}" if renews else ""
+            return (
+                f"⭐ Premium · {account['paid_left']} of {PLAN_SEARCHES} "
+                f"searches left{tail}."
+            )
         label = "paid search" if account["paid_left"] == 1 else "paid searches"
         return f"💳 {account['paid_left']} {label} left."
     if account["free_left"]:
-        return (
-            f"🎟 {account['free_left']} of {FREE_SEARCHES} free searches left."
-        )
-    return f"🎟 Free searches used up. Next search: ₦{PRICE_NGN:,}."
+        return f"🎟 {account['free_left']} of {FREE_SEARCHES} free searches left."
+    return (
+        f"🎟 Free searches used up. Premium: ₦{PLAN_PRICE_NGN:,} for "
+        f"{PLAN_DAYS} days."
+    )
 
 
 def paywall(telegram_id) -> str:
@@ -104,16 +143,19 @@ def paywall(telegram_id) -> str:
         return receipt(telegram_id)
     return (
         "🎟 <b>Your free searches are used up</b>\n\n"
-        f"You have used all {FREE_SEARCHES} free searches. A dossier now costs "
-        f"<b>₦{PRICE_NGN:,}</b> per search.\n\n"
+        f"You have used all {FREE_SEARCHES} free searches.\n\n"
+        "⭐ <b>SkipTrace Premium</b>\n"
+        f"<b>₦{PLAN_PRICE_NGN:,} for {PLAN_DAYS} days</b> — up to "
+        f"{PLAN_SEARCHES} dossiers.\n\n"
         "Payments are not switched on in this build yet. Ask the operator to "
-        "top up your account, then send /trace again."
+        "activate your plan, then send /trace again."
     )
 
 
 def welcome_line() -> str:
     """The allowance, phrased for /start."""
     return (
-        f"Each account gets {FREE_SEARCHES} free searches, then ₦{PRICE_NGN:,} "
-        "per dossier."
+        f"Each account gets {FREE_SEARCHES} free searches. After that, Premium "
+        f"is ₦{PLAN_PRICE_NGN:,} for {PLAN_DAYS} days "
+        f"(up to {PLAN_SEARCHES} searches)."
     )

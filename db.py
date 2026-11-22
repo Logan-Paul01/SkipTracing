@@ -213,21 +213,30 @@ def charge_search(telegram_id) -> None:
         )
 
 
-def grant_searches(telegram_id, count: int, plan=None, days=None) -> None:
-    """Add paid credits to an account.
+def grant_searches(
+    telegram_id, count: int, plan=None, days=None, reset: bool = False
+) -> None:
+    """Add paid credits to an account, or start a fresh plan period.
 
-    This is the only function a future payment integration has to call: it
-    already records the plan name and expiry, so nothing in the search
-    pipeline changes when billing goes live.
+    ``reset`` replaces the allowance instead of adding to it, which is what a
+    plan renewal wants. This is the only function a future payment integration
+    has to call: it already records the plan name and expiry, so nothing in the
+    search pipeline changes when billing goes live.
     """
     count = max(0, int(count or 0))
     touch_user(telegram_id)
     with _connect() as connection:
-        connection.execute(
-            "UPDATE users SET paid_searches_left = paid_searches_left + ? "
-            "WHERE telegram_id = ?",
-            (count, int(telegram_id)),
-        )
+        if reset:
+            connection.execute(
+                "UPDATE users SET paid_searches_left = ? WHERE telegram_id = ?",
+                (count, int(telegram_id)),
+            )
+        else:
+            connection.execute(
+                "UPDATE users SET paid_searches_left = paid_searches_left + ? "
+                "WHERE telegram_id = ?",
+                (count, int(telegram_id)),
+            )
         if plan:
             connection.execute(
                 """
@@ -238,6 +247,26 @@ def grant_searches(telegram_id, count: int, plan=None, days=None) -> None:
                 """,
                 (str(plan), days, f"+{int(days)} days" if days else None, int(telegram_id)),
             )
+
+
+def expire_plan(telegram_id) -> None:
+    """Drop an allowance whose paid period has ended.
+
+    Runs before the quota is read, so a lapsed plan never spends the previous
+    period's leftovers. The timestamp is SQLite's UTC ``YYYY-MM-DD HH:MM:SS``,
+    which sorts correctly as text.
+    """
+    with _connect() as connection:
+        connection.execute(
+            """
+            UPDATE users
+            SET paid_searches_left = 0, plan = 'free', plan_expires_at = NULL
+            WHERE telegram_id = ? AND plan != 'free'
+              AND plan_expires_at IS NOT NULL
+              AND plan_expires_at <= datetime('now')
+            """,
+            (int(telegram_id),),
+        )
 
 
 def all_users() -> list[dict]:

@@ -55,10 +55,16 @@ BOT_TOKEN = (
 # SQLite audit log location.
 DB_PATH = os.environ.get("DB_PATH", "skiptrace.db")
 
-# Free dossiers per account before the bot asks for payment. PRICE is only the
-# number printed in the paywall: no payment provider is connected yet.
+# Free dossiers per account before the bot asks for payment.
 FREE_SEARCHES = max(0, _int_env("FREE_SEARCHES", 5))
-PRICE_PER_SEARCH_NGN = max(0, _int_env("PRICE_PER_SEARCH_NGN", 200))
+
+# Launch plan: one price for one period and a hard cap on dossiers. No payment
+# provider is connected yet, so these numbers only appear in the paywall.
+# 20 searches keeps the worst case inside the free API credit; raise the cap
+# only after the provider bill is understood.
+PLAN_PRICE_NGN = max(0, _int_env("PLAN_PRICE_NGN", 200))
+PLAN_SEARCHES = max(0, _int_env("PLAN_SEARCHES", 20))
+PLAN_DAYS = max(1, _int_env("PLAN_DAYS", 30))
 
 # Optional pin for the hidden /broadcast command. When it is empty the first
 # account to send /broadcast claims ownership, so no Telegram ID has to be
@@ -72,7 +78,8 @@ SEARCH_MODE = os.environ.get("SEARCH_MODE", "auto").strip().lower()
 
 # Fast web-search backends. Both return real pages with extracted text and a
 # grounded answer in about a second, which is the whole point of "web" mode.
-# Tavily is preferred when both keys are present.
+# Exa is preferred when both keys are present: it is cheaper per request and
+# its free monthly credit covers more traces than Tavily's.
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "").strip()
 EXA_API_KEY = os.environ.get("EXA_API_KEY", "").strip()
 WEB_SEARCH_TIMEOUT = 12

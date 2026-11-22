@@ -52,11 +52,15 @@ SITE_LABELS = {
 
 
 def provider() -> str | None:
-    """Which web-search backend is configured, if any."""
-    if config.TAVILY_API_KEY:
-        return "tavily"
+    """Which web-search backend is configured, if any.
+
+    Exa wins when both keys are set: it is cheaper per request and its free
+    monthly credit covers roughly 200 company traces against Tavily's ~140.
+    """
     if config.EXA_API_KEY:
         return "exa"
+    if config.TAVILY_API_KEY:
+        return "tavily"
     return None
 
 
