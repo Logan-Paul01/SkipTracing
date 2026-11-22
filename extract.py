@@ -194,6 +194,16 @@ def _platform(url: str) -> tuple[str, str]:
     return "", ""
 
 
+# A profile link reaches the person; a post, video or status link does not, and
+# search results are full of them, so they are never reported as profiles.
+NOISE_PATHS = ("posts/", "pulse/", "video/", "reel/", "status/", "photo/", "watch")
+
+
+def _is_post_link(path: str) -> bool:
+    low = (path or "").lower()
+    return any(marker in low for marker in NOISE_PATHS)
+
+
 def _norm_phone(raw: str) -> str:
     digits = re.sub(r"\D", "", str(raw or ""))
     if digits.startswith("234"):
@@ -348,8 +358,19 @@ def _pick_about(
     return ""
 
 
-def _collect_social_links(answer: str, hits, person_tokens: set[str], company_tokens: set[str]):
-    """Split profile URLs into person vs company by handle and page title."""
+def _collect_social_links(
+    answer: str,
+    hits,
+    person_tokens: set[str],
+    company_tokens: set[str],
+    surname: str = "",
+):
+    """Split profile URLs into person vs company by handle and page title.
+
+    A person link must carry the surname (or every name token). Matching on a
+    first name alone attached other people's profiles to the subject, which is
+    worse than reporting nothing: `oluwaseyi-ajayi` is not `oluwaseyi-olowoye`.
+    """
     seen: set[str] = set()
     person: dict[str, list[str]] = {}
     company: dict[str, list[str]] = {}
@@ -376,11 +397,25 @@ def _collect_social_links(answer: str, hits, person_tokens: set[str], company_to
         path = path_only.lower()
         title_low = str(title or "").lower()
 
-        if any(token in path for token in person_tokens):
+        if _is_post_link(path):
+            continue
+
+        surname_hit = bool(surname) and surname in path
+        name_in_title = bool(surname) and surname in title_low
+        all_tokens = bool(person_tokens) and all(
+            token in path or token in title_low for token in person_tokens
+        )
+        # A LinkedIn /in/ URL is a person even when the headline names the
+        # company; it must never be reported as a company page.
+        linkedin_person = _domain == "linkedin.com" and path.startswith("/in/")
+
+        if surname_hit or all_tokens:
             bucket = person
-        elif any(token in path or token in title_low for token in company_tokens):
+        elif not linkedin_person and any(
+            token in path or token in title_low for token in company_tokens
+        ):
             bucket = company
-        elif any(token in title_low for token in person_tokens):
+        elif name_in_title:
             bucket = person
         else:
             continue
@@ -400,6 +435,12 @@ def collect(input_ctx, answer: str = "", hits=()) -> dict:
 
     person_tokens = _sig_tokens(name)
     company_tokens = _sig_tokens(company_name)
+    name_parts = [
+        part
+        for part in re.split(r"[^A-Za-z0-9]+", name.lower())
+        if len(part) >= 3
+    ]
+    surname = name_parts[-1] if len(name_parts) > 1 else ""
     input_digits = re.sub(r"\D", "", str(ctx.get("phone_e164") or ""))
 
     tagged: list[tuple[str, str]] = [(sentence, "answer") for sentence in _sentences(answer)]
@@ -466,7 +507,7 @@ def collect(input_ctx, answer: str = "", hits=()) -> dict:
                 bucket.append(clean)
 
     person_socials, company_socials = _collect_social_links(
-        answer, hits, person_tokens, company_tokens
+        answer, hits, person_tokens, company_tokens, surname
     )
 
     return {

@@ -14,6 +14,7 @@ from __future__ import annotations
 import html
 import re
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import extract
 
@@ -63,6 +64,72 @@ def _next_action(matches: list[dict]) -> str:
     return "manually review the top match before acting"
 
 
+def _pretty_phone(value: str) -> str:
+    """Nigerian E.164 to +234 803 123 4567, which is easier to dial and read."""
+    raw = str(value or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if digits.startswith("234") and len(digits) == 13:
+        return f"+234 {digits[3:6]} {digits[6:9]} {digits[9:]}"
+    return raw
+
+
+def _source_links(hits, limit: int = 4) -> str:
+    """The evidence behind the summary, as clickable source names.
+
+    Hosts are deduplicated, so ten LinkedIn pages collapse to one link and the
+    reader sees how much breadth is actually behind the claim.
+    """
+    hosts: dict[str, tuple[str, str]] = {}
+    for hit in hits or ():
+        url = str(hit.get("url") or "").strip()
+        if not url:
+            continue
+        host = (urlparse(url).netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if not host or host in hosts:
+            continue
+        label = " ".join(str(hit.get("site") or "").split()) or host
+        hosts[host] = (url, label)
+
+    if not hosts:
+        return ""
+
+    shown = list(hosts.values())[:limit]
+    links = [
+        f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
+        for url, label in shown
+    ]
+    remaining = len(hosts) - len(shown)
+    joined = ", ".join(links)
+    if remaining > 0:
+        joined += f" and {remaining} more"
+    return joined
+
+
+def _answer_block(answer: str, hits) -> list[str]:
+    """The grounded summary as a quote, with its sources as blue text.
+
+    No emoji and no heading glyph: the quote bar carries the hierarchy, the
+    prose stays in italics, and the source names are real links.
+    """
+    text = _clip_sentence(answer, ANSWER_LIMIT)
+    if not text:
+        return []
+
+    lines = [
+        "<blockquote><b>What the sources say</b>",
+        f"<i>{html.escape(text)}</i>",
+    ]
+    sources = _source_links(hits)
+    if sources:
+        lines.append("")
+        lines.append(f"<b>Evidence:</b> {sources}")
+    lines.append("</blockquote>")
+    lines.append("")
+    return lines
+
+
 def _link(label: str, url: str) -> str:
     safe_url = html.escape(str(url or ""), quote=True)
     return f'<b>{html.escape(label)}:</b> <a href="{safe_url}">{html.escape(str(url or ""))}</a>'
@@ -94,7 +161,9 @@ def _contact_block(person: dict) -> list[str]:
     if phones:
         lines.extend(f"<b>Phone:</b> {html.escape(number)}" for number in phones[:2])
     else:
-        lines.append(f"<b>Phone:</b> {NOT_FOUND}")
+        # The searched number is already printed in the header, so this line
+        # reports the absence of an extra number rather than "not found".
+        lines.append("<b>Phone:</b> no other number in public sources")
 
     if person.get("whatsapp"):
         lines.extend(
@@ -198,7 +267,7 @@ def format_dossier(
 
     name = html.escape(str(input_ctx.get("name") or "Unknown"))
     # Collectors need the full number to dial it, so it is never masked here.
-    phone = html.escape(str(input_ctx.get("phone_e164") or "").strip() or NOT_FOUND)
+    phone = html.escape(_pretty_phone(str(input_ctx.get("phone_e164") or "").strip()) or NOT_FOUND)
     gender = html.escape(str(input_ctx.get("gender") or "Not stated"))
     company_name = html.escape(
         str(input_ctx.get("company") or "").strip()
@@ -224,10 +293,7 @@ def format_dossier(
 
     body: list[str] = list(head)
 
-    if answer:
-        body.append("🧠 <b>What the sources say</b>")
-        body.append(html.escape(_clip_sentence(answer, ANSWER_LIMIT)))
-        body.append("")
+    body.extend(_answer_block(answer, hits))
 
     body.extend(_contact_block(structured["person"]))
 

@@ -6,3 +6,4 @@ bot.log
 .venv/
 venv/
 custom_venv/
+.bot.pid
