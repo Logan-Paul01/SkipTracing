@@ -3,12 +3,14 @@
 Tavily and Exa are web-search APIs: you send a query and get back real pages
 with titles, URLs, extracted text and (optionally) a grounded answer with
 citations. That is the same pattern as Google's AI mode, and it answers in
-roughly one to two seconds, where Maigret's 3,500-site walk takes hours.
+roughly one to two seconds, where walking thousands of profile sites takes
+hours.
+
 
 This module turns whichever provider is configured into the plain hit dicts
 the scorer already understands, so the ranking rules stay unchanged and every
-lead still points at a real URL. `searcher.py` keeps Maigret and the curated
-HTTP checks as the fallback when no web-search key is present.
+lead still points at a real URL. `searcher.py` keeps a few curated HTTP checks
+as the fallback when no web-search key is present.
 """
 
 from __future__ import annotations
@@ -399,7 +401,8 @@ async def search_subject(name: str, company: str = "", phone_variants=()) -> tup
     """Search the open web for the subject; return (hits, grounded_answer).
 
     Never raises: a provider failure degrades to an empty result set so the
-    caller can fall back to Maigret or report an honest "nothing found".
+    caller can fall back to the curated checks or report an honest "nothing
+    found".
     """
     backend = provider()
     if backend is None:

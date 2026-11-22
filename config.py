@@ -1,10 +1,40 @@
 """Runtime configuration for SkipTrace V1.
 
-Every secret comes from the environment. Nothing here is committed with a
-value, and the module never writes configuration to disk.
+Every secret comes from the environment or an optional git-ignored ``.env``
+file. Nothing here is committed with a value, and the module never writes
+configuration to disk.
 """
 
 import os
+
+
+def _load_dotenv(path: str) -> None:
+    """Load KEY=VALUE lines from an optional .env file.
+
+    Real environment variables always win, so a host's secret store is never
+    overridden by a stale file. The file is git-ignored and must never be
+    committed: this repository is public.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv(os.environ.get("ENV_FILE", ".env"))
 
 # Required. bot.py exits with a clear error when this is missing. The
 # Skiptracingbotkey fallback matches the secret name configured in this
@@ -17,9 +47,9 @@ BOT_TOKEN = (
 # SQLite audit log location.
 DB_PATH = os.environ.get("DB_PATH", "skiptrace.db")
 
-# "auto"/"web" uses Tavily or Exa when a key is set, Maigret otherwise.
-# "maigret" forces Maigret, "http" forces the curated checks (fast smoke test
-# or a network where Maigret's sites block the host).
+# "auto"/"web" uses Tavily or Exa when a key is set, and the curated profile
+# checks when it is not. "http" forces the curated checks: a fast smoke test,
+# or a network where the profile sites block the host.
 SEARCH_MODE = os.environ.get("SEARCH_MODE", "auto").strip().lower()
 
 # Fast web-search backends. Both return real pages with extracted text and a
@@ -43,10 +73,9 @@ WEB_SITE_CHARS = 3200
 # outranks their real profile.
 WEB_MIN_NAME_SIMILARITY = 0.55
 
-# Maigret search behaviour.
-MAIGRET_TIMEOUT = 12
-MAIGRET_MAX_CONNECTIONS = 4
-MAIGRET_TAGS = ["social", "dating", "forum", "misc"]
+# Curated fallback checks (searcher.py), used only when no search key is set.
+PROFILE_TIMEOUT = 10
+PROFILE_CONCURRENCY = 4
 
 # Scoring / reporting thresholds.
 MIN_SCORE_TO_REPORT = 40

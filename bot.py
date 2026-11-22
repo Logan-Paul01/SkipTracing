@@ -2,7 +2,8 @@
 
 Headless, long-polling, synchronous telebot handlers around an async
 search pipeline. No web server and no webhook. The web path asks Tavily or
-Exa for a grounded, cited answer; Maigret is only the fallback.
+Exa for a grounded, cited answer; the curated HTTP checks are only the
+fallback for a host with no search key.
 """
 
 from __future__ import annotations
@@ -246,7 +247,7 @@ async def run_search(uid, user_input) -> tuple[str, list[dict]]:
 
     if mode in ("auto", "web") and websearch.provider() is not None:
         # Fast path: a real web search returns pages plus a grounded answer in
-        # seconds. Fall through to Maigret only if it finds nothing at all.
+        # seconds. Fall through to the curated checks only if it finds nothing.
         hits, answer = await websearch.search_subject(name, company, phone_variants)
         web_hits = len(hits)
         profiles_by_url = {
@@ -264,8 +265,8 @@ async def run_search(uid, user_input) -> tuple[str, list[dict]]:
 
     if not hits:
         hits = await searcher.search_usernames(usernames)
-        # V1 limitation: Maigret confirms profile existence, but bio fields are
-        # not reliably extracted. Display name falls back to the handle.
+        # The curated checks only confirm a profile exists; bio fields are not
+        # extracted. Display name falls back to the handle.
         profiles_by_url = {
             hit["url"]: {
                 "display_name": hit.get("username", ""),
@@ -332,7 +333,7 @@ def _run_and_reply(message, state) -> None:
         bot.send_message(chat_id, "🔎 Searching the web… this usually takes seconds.")
     else:
         bot.send_message(
-            chat_id, "🔎 Searching public profiles… this can take a few minutes."
+            chat_id, "🔎 Searching public profiles… this takes a few seconds."
         )
 
     try:

@@ -1,18 +1,23 @@
-"""Async username search across public profiles.
+"""Curated public-profile checks over plain HTTP.
 
-Maigret is the primary engine: it checks a bundled database of public
-profile URLs. When Maigret is missing or its site database cannot be
-loaded, a small curated HTTP fallback keeps the bot working. Both paths
-only touch public profile pages; no login-walled endpoints are used.
+This is the fallback used when no web-search key is configured, or when
+``SEARCH_MODE=http`` forces it: a handful of public profile URLs are requested
+directly, and a page only counts when its own title names the handle.
+
+Maigret was removed from this project on purpose. Walking its bundled
+~3,500-site database per handle meant ~89,000 requests for a full trace, which
+measured at 4-5 hours, and it pulled in Flask plus a reporting stack that made
+the bot far too heavy for a small host. ``websearch.py`` (Exa or Tavily) is the
+search engine; nothing here runs during a normal trace.
+
+Only public profile pages are touched; no login-walled endpoints are used.
 """
 
 from __future__ import annotations
 
 import asyncio
 import html
-import inspect
 import logging
-import os
 import re
 
 import aiohttp
@@ -55,172 +60,6 @@ FALLBACK_SITES = (
     },
 )
 
-_maigret_search = None
-_maigret_sites = None
-_maigret_unavailable = False
-
-
-def _load_maigret():
-    """Lazily import Maigret and load its bundled site database.
-
-    Returns (search_coroutine, site_dict) or None when Maigret cannot be
-    used. A failure is remembered so later calls skip straight to the HTTP
-    fallback instead of retrying an import that will not succeed.
-    """
-    global _maigret_search, _maigret_sites, _maigret_unavailable
-
-    if _maigret_search is not None:
-        return _maigret_search, _maigret_sites
-    if _maigret_unavailable:
-        return None
-
-    try:
-        import maigret
-        from maigret import search as maigret_search
-        from maigret.sites import MaigretDatabase
-
-        data_path = os.path.join(
-            os.path.dirname(os.path.abspath(maigret.__file__)),
-            "resources",
-            "data.json",
-        )
-        if not os.path.exists(data_path):
-            raise RuntimeError(f"Maigret site database not found at {data_path}")
-
-        database = MaigretDatabase()
-        loader = getattr(database, "load_from_file", None) or getattr(
-            database, "load_from_path", None
-        )
-        if loader is None:
-            raise RuntimeError("MaigretDatabase exposes no loader")
-        loaded = loader(data_path)
-        if loaded is not None:
-            database = loaded
-
-        raw_sites = getattr(database, "sites", None) or {}
-        if isinstance(raw_sites, dict):
-            all_sites = dict(raw_sites)
-            for name, site in all_sites.items():
-                if not getattr(site, "name", ""):
-                    site.name = name
-        else:
-            all_sites = {
-                getattr(site, "name", ""): site
-                for site in raw_sites
-                if getattr(site, "name", "")
-            }
-
-        wanted_tags = set(config.MAIGRET_TAGS)
-        tagged_sites = {
-            name: site
-            for name, site in all_sites.items()
-            if wanted_tags & set(getattr(site, "tags", []) or [])
-        }
-
-        if not tagged_sites and not all_sites:
-            raise RuntimeError("Maigret site database is empty")
-
-        _maigret_search = maigret_search
-        _maigret_sites = tagged_sites or all_sites
-        return _maigret_search, _maigret_sites
-    except Exception as exc:  # noqa: BLE001 - degrade instead of crashing
-        logger.warning(
-            "Maigret unavailable (%s); using curated HTTP fallback", exc
-        )
-        _maigret_unavailable = True
-        return None
-
-
-def _status_text(value) -> str:
-    status = value.get("status") if isinstance(value, dict) else getattr(value, "status", None)
-    status = getattr(status, "status", status)
-    status = getattr(status, "name", status)
-    return str(status or "").lower()
-
-
-def _iter_results(results):
-    if hasattr(results, "items"):
-        for site_name, value in results.items():
-            yield site_name, value
-    elif isinstance(results, (list, tuple, set)):
-        for value in results:
-            yield None, value
-
-
-def _maigret_hits(username: str, results) -> dict:
-    hits: dict[str, dict] = {}
-
-    for site_name, value in _iter_results(results):
-        if value is None:
-            continue
-
-        status = _status_text(value)
-        if "claimed" not in status and "found" not in status:
-            continue
-
-        site = value.get("site") if isinstance(value, dict) else getattr(value, "site", None)
-        name = site_name or getattr(site, "name", None) or ""
-        url = None
-        if isinstance(value, dict):
-            url = value.get("url") or value.get("url_user") or value.get("url_main")
-        else:
-            url = (
-                getattr(value, "url_user", None)
-                or getattr(value, "url", None)
-                or getattr(value, "url_main", None)
-            )
-        if not name or not url:
-            continue
-
-        tags = getattr(site, "tags", None) if site is not None else None
-        if tags is None and isinstance(value, dict):
-            tags = value.get("tags")
-        if isinstance(tags, str):
-            tags = [tags]
-
-        hits[name] = {
-            "site": name,
-            "url": url,
-            "username": username,
-            "tags": list(tags or []),
-            "source": "maigret",
-        }
-
-    return hits
-
-
-async def _maigret_search_one(username: str) -> dict:
-    """Search one username with Maigret; return site_name -> hit dict."""
-    loaded = _load_maigret()
-    if loaded is None:
-        return {}
-    search_func, sites = loaded
-
-    options = {
-        "logger": logger,
-        "timeout": config.MAIGRET_TIMEOUT,
-        "max_connections": config.MAIGRET_MAX_CONNECTIONS,
-        "no_progressbar": True,
-    }
-
-    try:
-        params = inspect.signature(search_func).parameters
-        has_kwargs = any(
-            param.kind is inspect.Parameter.VAR_KEYWORD
-            for param in params.values()
-        )
-        if not has_kwargs:
-            options = {key: value for key, value in options.items() if key in params}
-        results = search_func(username, sites, **options)
-        if inspect.isawaitable(results):
-            results = await results
-    except Exception as exc:  # noqa: BLE001 - one bad username must not stop the batch
-        logger.warning("Maigret lookup failed for %s: %s", username, exc)
-        return {}
-
-    return _maigret_hits(username, results)
-
-
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 
@@ -234,18 +73,18 @@ def _page_title(body: str) -> str:
 def _title_confirms_handle(body: str, username: str) -> bool:
     """Only count a page whose title names the requested handle.
 
-    Logged-out Instagram serves a login page for every handle, and login
-    walls are not profile evidence. A title containing the handle is a crude
-    but reliable positive signal for GitHub, TikTok and similar sites.
+    Logged-out Instagram serves a login page for every handle, and login walls
+    are not profile evidence. A title containing the handle is a crude but
+    reliable positive signal for GitHub, TikTok and similar sites.
     """
     title = _page_title(body).lower()
     return bool(title) and username.lower() in title
 
 
-async def _http_fallback_one(username: str) -> dict:
+async def _check_one(username: str) -> dict:
     """Check the curated public sites directly over HTTP."""
     hits: dict[str, dict] = {}
-    timeout = aiohttp.ClientTimeout(total=config.MAIGRET_TIMEOUT)
+    timeout = aiohttp.ClientTimeout(total=config.PROFILE_TIMEOUT)
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml",
@@ -283,7 +122,7 @@ async def _http_fallback_one(username: str) -> dict:
 
 
 async def search_usernames(usernames) -> list[dict]:
-    """Search a list of usernames in batches and return flat hit dicts."""
+    """Check a list of usernames in small batches and return flat hit dicts."""
     unique: list[str] = []
     for username in usernames or ():
         cleaned = str(username or "").strip().lower()
@@ -292,23 +131,13 @@ async def search_usernames(usernames) -> list[dict]:
 
     hits: list[dict] = []
     seen_urls: set[str] = set()
-    batch_size = max(1, config.MAIGRET_MAX_CONNECTIONS // 2)
-    mode = (getattr(config, "SEARCH_MODE", "auto") or "auto").strip().lower()
+    batch_size = max(1, config.PROFILE_CONCURRENCY)
 
     for start in range(0, len(unique), batch_size):
         batch = unique[start : start + batch_size]
-        if mode == "http":
-            # Forced fallback: useful for a fast smoke test or a blocked network.
-            use_fallback = True
-        else:
-            use_fallback = _load_maigret() is None
-
-        if use_fallback:
-            tasks = [_http_fallback_one(username) for username in batch]
-        else:
-            tasks = [_maigret_search_one(username) for username in batch]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(
+            *(_check_one(username) for username in batch), return_exceptions=True
+        )
 
         for username, result in zip(batch, results):
             if isinstance(result, Exception):

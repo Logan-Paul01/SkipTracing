@@ -9,9 +9,10 @@ deterministically, and replies with one HTML dossier. It runs on long polling,
 writes an audit log to SQLite, and never calls or messages the debtor.
 
 Search is a real web-search API — **Exa** or **Tavily** — which returns live
-pages plus a grounded, cited answer in a couple of seconds. Maigret is not the
-engine and is not part of a normal trace; it survives only as an optional
-legacy fallback for a host with no search key.
+pages plus a grounded, cited answer in a couple of seconds. Maigret has been
+removed entirely: its 3,500-site walk and dependency tree made both the runtime
+and the install far too heavy. With no search key, the bot falls back to a
+handful of curated public-profile checks.
 
 ## How a trace runs
 
@@ -35,7 +36,7 @@ legacy fallback for a host with no search key.
 | `normalizer.py` | Nigerian phone parsing; returns E.164, digit variants and carrier/region metadata |
 | `names.py` | Orthographic rules plus soundex/metaphone/nysiis to derive candidate handles |
 | `websearch.py` | **The search engine**: Exa and Tavily queries, grounded-answer prompt, direct company-site fetch |
-| `searcher.py` | Legacy fallback only — optional Maigret walk and the curated HTTP checks, reached when no search key is configured or the web search returns nothing |
+| `searcher.py` | Curated public-profile checks (TikTok, Facebook, LinkedIn, GitHub, Nairaland), used only when no search key is set |
 | `extract.py` | Structured person/company fields pulled from the answer, the pages and the company site |
 | `scorer.py` | Auditable per-page confidence score and the report threshold |
 | `formatter.py` | Dossier layout, clipping and length trimming |
@@ -93,24 +94,25 @@ Which provider runs:
 
 - both keys set → **Tavily** (pages and the grounded answer come back in one request)
 - only `EXA_API_KEY` set → **Exa** (`/search` for pages, `/answer` for the cited summary) — the provider in use wherever only the Exa key is configured
-- neither key set → the legacy fallback below
+- neither key set → the curated checks below
 
 `SEARCH_MODE` defaults to `auto` / `web`, which means the Exa/Tavily web search.
-It also accepts `maigret` and `http`, which force the legacy paths.
+It also accepts `http`, which forces the curated checks.
 
-### Legacy fallback (not used in normal operation)
+### Curated checks (no key required)
 
-`searcher.py` keeps two non-web paths for hosts with no search key and for
-smoke tests. Neither is part of the Exa/Tavily pipeline:
+`searcher.py` is the only non-web path left: five public profile URLs (TikTok,
+Facebook, LinkedIn, GitHub, Nairaland) requested directly, a page counting only
+when its own `<title>` names the handle. It runs when no search key is
+configured, when every web query comes back with zero pages, or when
+`SEARCH_MODE=http` forces it. `PROFILE_TIMEOUT=10` and `PROFILE_CONCURRENCY=4`
+bound it.
 
-- `maigret` — the classic username walk over ~3,500 sites per handle. With up
-to 25 generated usernames that is ~89,000 requests, measured at 4-5 hours per
-trace on this host. This is exactly why it is no longer the default.
-- `http` — five curated public sites (TikTok, Facebook, LinkedIn, GitHub,
-Nairaland) in a few seconds; useful on a blocked network.
-
-The web path only drops to Maigret if no key is configured at all, or if every
-query comes back with zero pages.
+Maigret was deleted from the project. It walked ~3,500 sites per handle —
+~89,000 requests for a full trace, measured at 4-5 hours — and pulled in Flask
+plus a reporting stack, an unreasonable install for a 512 MB host. It also
+checked far more sites than a dossier ever uses: the top eight leads are all a
+collector reads.
 
 ### The queries
 
@@ -222,11 +224,17 @@ it, send `/start`, and send `/trace` to run a search:
 - `/skip` — accept an empty company at step 4
 - `/cancel` — reset the conversation
 
-A `.env` file is not read automatically; export the variables in your shell or
-inject them from your platform's secret store. `BOT_TOKEN` is the documented
-name; the project's own secret name `Skiptracingbotkey` is accepted as a
-fallback. Phone numbers must be Nigerian (+234). `DB_PATH` is optional and
-defaults to `skiptrace.db`.
+A `.env` file is read automatically if it sits next to `bot.py` (git-ignored,
+loaded at import, never overriding a variable that is already exported):
+
+```
+BOT_TOKEN=123456789:your_botfather_token
+EXA_API_KEY=your_exa_key
+```
+
+`BOT_TOKEN` is the documented name; the project's own secret name
+`Skiptracingbotkey` is accepted as a fallback. Phone numbers must be Nigerian
+(+234). `DB_PATH` is optional and defaults to `skiptrace.db`.
 
 ## Configuration
 
@@ -235,7 +243,8 @@ defaults to `skiptrace.db`.
 | `BOT_TOKEN` | — | BotFather token (required) |
 | `Skiptracingbotkey` | — | Accepted fallback for `BOT_TOKEN` |
 | `DB_PATH` | `skiptrace.db` | SQLite audit log |
-| `SEARCH_MODE` | `auto` | `auto`/`web` (Exa/Tavily engine), or the legacy `maigret` / `http` |
+| `SEARCH_MODE` | `auto` | `auto`/`web` (Exa/Tavily engine) or `http` (curated checks) |
+| `ENV_FILE` | `.env` | Path read for keys when they are not exported |
 | `EXA_API_KEY` | — | Enables the Exa engine |
 | `TAVILY_API_KEY` | — | Enables the Tavily engine (used instead of Exa when both are set) |
 
@@ -243,8 +252,13 @@ Tuning constants live in `config.py`: `WEB_MAX_RESULTS=8`,
 `WEB_HIGHLIGHT_CHARS=600`, `WEB_SEARCH_TIMEOUT=12`,
 `WEB_SEARCH_OVERALL_TIMEOUT=30`, `WEB_SITE_TIMEOUT=3`, `WEB_SITE_TOTAL=4`,
 `WEB_SITE_CHARS=3200`, `WEB_MIN_NAME_SIMILARITY=0.55`,
-`MIN_SCORE_TO_REPORT=40`, `MAX_USERNAMES=25`, `MAIGRET_TIMEOUT=12`,
-`MAIGRET_MAX_CONNECTIONS=4`.
+`MIN_SCORE_TO_REPORT=40`, `MAX_USERNAMES=25`, `PROFILE_TIMEOUT=10`,
+`PROFILE_CONCURRENCY=4`.
+
+Keys can come from the environment **or** from a `.env` file in the working
+directory: `config.py` reads it at import time and never overrides a variable
+that is already set. `.env` is git-ignored — never commit it, because this
+repository is public.
 
 ## Deploy notes
 
@@ -260,6 +274,21 @@ webhook and no inbound traffic.
 - Make sure the filesystem holding `DB_PATH` persists if the audit log should
   survive restarts. One instance only; Telegram long polling does not support
   two pollers on one token.
+
+### Wispbyte
+
+1. Create a free server, technology **Python**. 512 MB RAM and 1 GB disk are
+   enough now that Maigret is gone.
+2. **GitHub Integration** → repository URL, branch `main` → **Clone**. Wispbyte
+   has no push webhook: after a commit, press **Pull**, then restart the server.
+3. **Startup** → command: `pip install -r requirements.txt && python bot.py`.
+4. **Startup → Server Configuration** → add `BOT_TOKEN` and `EXA_API_KEY` (or
+   `TAVILY_API_KEY`). If the egg refuses custom variables, upload a `.env` with
+   those two lines through **Files**; `config.py` reads it automatically.
+5. Start, then watch **Console** for `Authenticated as @...`.
+
+Free servers have no SFTP, and a pull only takes effect on the next restart.
+Never run two pollers on one token: stop any other instance first.
 
 ## Security and hard rules
 
@@ -290,19 +319,19 @@ expansions, plus soundex, metaphone and nysiis agreement) covers that noise
 cheaply and identically on every run, and every point in a dossier traces back
 to a named rule — which matters when a collector has to justify an action. An
 LLM would invent handles that do not exist, vary between identical inputs, and
-blur the audit trail. This governs only the legacy Maigret fallback, which
-searches by handle; the Exa/Tavily path matches on page titles, snippets and
-URLs instead, so handle variation no longer decides a lead.
+blur the audit trail. Handle generation still feeds the no-key fallback checks,
+which search by handle; the Exa/Tavily path matches on page titles, snippets
+and URLs instead, so handle variation no longer decides a lead.
 
 ## Dependency pins
 
-`maigret==0.6.6` is pinned rather than `0.4.4` because `0.4.4` hard-pins
-`aiohttp==3.8.1`, which conflicts with the required `aiohttp==3.14.5` and has no
-Python 3.12 wheel, so the pair cannot be installed on `python:3.12-slim` at all.
-`aiohttp==3.14.5` is the client version Maigret 0.6.6 requires and the bot only
-uses its standard client API. Maigret also pulls optional reporting dependencies
-(including Flask); `bot.py` never imports or runs them, so the bot stays a
-headless long-polling process.
+`maigret`, `python-Levenshtein` and Maigret's reporting dependencies are gone.
+Maigret's 0.6.6 line hard-pins `aiohttp` and drags in Flask and a web report
+module the bot never imports. With it removed the install is
+`pyTelegramBotAPI`, `phonenumbers`, `jellyfish` and `aiohttp`, which fits
+comfortably in a 512 MB container. The Levenshtein package went with it:
+`names.py` uses a pure-Python ratio alongside `jellyfish`'s Jaro-Winkler, so the
+C extension was never needed.
 
 ## Limitations
 
@@ -311,7 +340,8 @@ headless long-polling process.
   pages; an uncommon name or an unlisted company can come back thin or empty.
 - A company site that is unreachable from the host (or down) yields no address
   or company email; the fetch is capped and then skipped for 10 minutes.
-- The HTTP fallback does not check Instagram: logged-out Instagram serves a
+- The curated checks do not cover Instagram: logged-out Instagram serves a
   login page that cannot reliably distinguish a real profile, so it is skipped
-  rather than reported as a match. The legacy Maigret path still checks it.
+  rather than reported as a match. Instagram profiles are still found through
+  Exa/Tavily.
 - Phone numbers must be Nigerian (+234).
