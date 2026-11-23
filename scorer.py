@@ -12,6 +12,10 @@ import jellyfish
 
 import config
 
+# A token on the page counts as the debtor's name token from this Jaro-Winkler
+# score upwards; below it, the page simply does not carry that part of the name.
+TOKEN_MATCH = 0.80
+
 
 def _tokens(value) -> list[str]:
     """Split names and handles into comparable words.
@@ -28,20 +32,20 @@ def _tokens(value) -> list[str]:
 
 
 def _name_similarity(input_name, profile_name) -> float:
-    """Compare names against a display name or handle, order-independently."""
+    """The share of the debtor's name that the page carries, 0.0 - 1.0.
+
+    Each token of the *input* name is scored against its best match on the
+    page, and the average is taken over the input tokens only. Dividing by the
+    page's token count made a job title or site suffix dilute a correct name:
+    "Chinedu Okafor - Engineer | LinkedIn" scored 0.50, under the 0.55 floor,
+    so the real profile was thrown away. Extra words on the page must not cost
+    anything, while a page that carries only the surname still does: the token
+    it lacks scores nothing, which keeps the namesake noise out.
+    """
     left = _tokens(input_name)
     right = _tokens(profile_name)
     if not left or not right:
         return 0.0
-
-    # A single-token handle may contain every name token (chineduokafor).
-    if len(right) == 1 and len(left) > 1:
-        packed = right[0]
-        covered = sum(
-            1 for token in left if len(token) >= 3 and token in packed
-        )
-        if covered:
-            return covered / len(left)
 
     # With a single input token (a collector typed only a first name), a
     # handle like chinedu.okafor should still match strongly.
@@ -50,12 +54,25 @@ def _name_similarity(input_name, profile_name) -> float:
             jellyfish.jaro_winkler_similarity(left[0], token) for token in right
         )
 
-    total = 0.0
+    # A page title or handle may pack the whole name into one token
+    # (chineduokafor, chineduokafor_official), even alongside other words.
+    packed = max(
+        (
+            sum(1 for token in left if len(token) >= 3 and token in other)
+            / len(left)
+            for other in right
+        ),
+        default=0.0,
+    )
+
+    covered = 0.0
     for token in left:
-        total += max(
+        best = max(
             jellyfish.jaro_winkler_similarity(token, other) for other in right
         )
-    return total / max(len(left), len(right))
+        if best >= TOKEN_MATCH:
+            covered += best
+    return max(covered / len(left), packed)
 
 
 def _phone_in_text(phone_variants, text):
@@ -123,6 +140,8 @@ def score_hit(hit: dict, profile: dict, input_ctx: dict) -> dict:
     else:
         reasons.append("Public profile exists")
 
+    # The page title carries the name; the description is compared only when
+    # the title has none, so a company page is not matched on its blurb.
     display_name = profile.get("display_name") or hit.get("username") or ""
     similarity = _name_similarity(input_ctx.get("name"), display_name)
     if similarity > 0:

@@ -111,8 +111,15 @@ def _username_from_url(url: str) -> str:
     return candidate if re.fullmatch(r"[A-Za-z0-9._-]{3,40}", candidate or "") else ""
 
 
-def build_queries(name: str, company: str = "", phone_variants=()) -> list[str]:
-    """The queries a human skiptracer would actually type."""
+def build_queries(name: str, company: str = "") -> list[str]:
+    """The queries a human skiptracer would actually type.
+
+    The debtor's number is deliberately never searched. A phone number is not
+    indexed against a person, so a number query returns directories, data
+    lists and tutorials instead of a profile, and every such query spends
+    credits for nothing. The number is still used to build handle candidates
+    and to score pages that mention it.
+    """
     name = " ".join(str(name or "").split())
     company = " ".join(str(company or "").split())
     queries: list[str] = []
@@ -128,13 +135,6 @@ def build_queries(name: str, company: str = "", phone_variants=()) -> list[str]:
         queries.append(f'"{name}" Nigeria')
 
     queries.append(f'"{name}" linkedin OR facebook OR instagram profile')
-
-    for variant in phone_variants or ():
-        digits = re.sub(r"\D", "", str(variant or ""))
-        if len(digits) >= 10:
-            queries.append(f'"{digits}" OR "{digits}" Nigeria')
-            break
-
     return queries
 
 
@@ -240,14 +240,14 @@ async def _tavily_search(session, query: str, headers: dict, with_answer: bool =
     return hits, answer
 
 
-async def _run(backend: str, name: str, company: str, phone_variants) -> tuple[list[dict], str]:
+async def _run(backend: str, name: str, company: str) -> tuple[list[dict], str]:
     headers = {"Content-Type": "application/json"}
     if backend == "exa":
         headers["x-api-key"] = config.EXA_API_KEY
     else:
         headers["Authorization"] = f"Bearer {config.TAVILY_API_KEY}"
 
-    queries = build_queries(name, company, phone_variants)
+    queries = build_queries(name, company)
 
     async with aiohttp.ClientSession() as session:
         if backend == "exa":
@@ -401,7 +401,7 @@ async def _fetch_company_site(hits, company: str, answer: str = "") -> list[dict
     return pages
 
 
-async def search_subject(name: str, company: str = "", phone_variants=()) -> tuple[list[dict], str]:
+async def search_subject(name: str, company: str = "") -> tuple[list[dict], str]:
     """Search the open web for the subject; return (hits, grounded_answer).
 
     Never raises: a provider failure degrades to an empty result set so the
@@ -414,7 +414,7 @@ async def search_subject(name: str, company: str = "", phone_variants=()) -> tup
 
     try:
         hits, answer = await asyncio.wait_for(
-            _run(backend, name, company, phone_variants),
+            _run(backend, name, company),
             timeout=config.WEB_SEARCH_OVERALL_TIMEOUT,
         )
     except asyncio.TimeoutError:

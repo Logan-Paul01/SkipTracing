@@ -23,6 +23,21 @@ def _connect():
         connection.close()
 
 
+def _columns(connection, table: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _ensure_column(connection, table: str, column: str, ddl: str) -> None:
+    """Add a column to a database file created by an older build.
+
+    ``init_db`` runs on every start against whatever file the host already
+    has, so a new counter has to be added in place rather than requiring a
+    manual migration step on the server.
+    """
+    if column not in _columns(connection, table):
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def init_db() -> None:
     with _connect() as connection:
         connection.execute(
@@ -81,6 +96,23 @@ def init_db() -> None:
             )
             """
         )
+        # Paid-plan demand list. Accounts land here when they hit the paywall
+        # or send /premium; ``claimed_paid_at`` records that the collector says
+        # the transfer is done, so the operator can confirm and activate.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS waitlist (
+                telegram_id INTEGER PRIMARY KEY,
+                telegram_username TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                claimed_paid_at TEXT
+            )
+            """
+        )
+        _ensure_column(connection, "users", "purchases", "purchases INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "waitlist", "claimed_paid_at", "claimed_paid_at TEXT")
+        _ensure_column(connection, "waitlist", "sender_name", "sender_name TEXT")
+        _ensure_column(connection, "waitlist", "resolved_at", "resolved_at TEXT")
         # Accounts were only recorded once the allowance existed, so anyone who
         # ran a search before that is backfilled here: /broadcast must reach
         # early users too. INSERT OR IGNORE keeps the counters of live accounts.
@@ -242,7 +274,8 @@ def grant_searches(
                 """
                 UPDATE users SET plan = ?, plan_expires_at =
                     CASE WHEN ? IS NULL THEN NULL
-                         ELSE datetime('now', ?) END
+                         ELSE datetime('now', ?) END,
+                    purchases = purchases + 1
                 WHERE telegram_id = ?
                 """,
                 (str(plan), days, f"+{int(days)} days" if days else None, int(telegram_id)),
@@ -278,6 +311,133 @@ def all_users() -> list[dict]:
             "ORDER BY first_seen ASC"
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def join_waitlist(telegram_id, telegram_username="") -> bool:
+    """Put an account on the paid-plan demand list.
+
+    Called when the paywall is shown and by /premium, so the operator can see
+    who actually reached the point of being willing to pay. Returns True only
+    the first time an account joins.
+    """
+    if not telegram_id:
+        return False
+    touch_user(telegram_id, telegram_username)
+    with _connect() as connection:
+        existing = connection.execute(
+            "SELECT 1 FROM waitlist WHERE telegram_id = ?", (int(telegram_id),)
+        ).fetchone()
+        connection.execute(
+            """
+            INSERT INTO waitlist (telegram_id, telegram_username)
+            VALUES (?, ?)
+            ON CONFLICT (telegram_id) DO UPDATE SET
+                telegram_username = COALESCE(
+                    NULLIF(excluded.telegram_username, ''),
+                    waitlist.telegram_username
+                )
+            """,
+            (int(telegram_id), (telegram_username or "").lstrip("@")),
+        )
+    return existing is None
+
+
+def mark_payment_claim(telegram_id, sender_name="") -> bool:
+    """Record a payment claim with the name on the transfer.
+
+    Payment is manual, so the claim only reaches the operator to be matched
+    against the bank statement; the plan itself is switched on by
+    ``access.grant_plan`` once the transfer is confirmed. A repeat claim
+    replaces the sender name and reopens the claim for checking. Returns True
+    only on the first claim.
+    """
+    if not telegram_id:
+        return False
+    touch_user(telegram_id)
+    sender = " ".join(str(sender_name or "").split())[:80]
+    with _connect() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO waitlist (telegram_id) VALUES (?)",
+            (int(telegram_id),),
+        )
+        row = connection.execute(
+            "SELECT claimed_paid_at FROM waitlist WHERE telegram_id = ?",
+            (int(telegram_id),),
+        ).fetchone()
+        first = row is None or row["claimed_paid_at"] is None
+        connection.execute(
+            """
+            UPDATE waitlist SET
+                claimed_paid_at = COALESCE(claimed_paid_at, CURRENT_TIMESTAMP),
+                sender_name = COALESCE(NULLIF(?, ''), sender_name),
+                resolved_at = NULL
+            WHERE telegram_id = ?
+            """,
+            (sender, int(telegram_id)),
+        )
+    return first
+
+
+def waitlist_row(telegram_id) -> dict:
+    """The waitlist/claim row for one account, or an empty dict."""
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM waitlist WHERE telegram_id = ?", (int(telegram_id),)
+        ).fetchone()
+    return dict(row) if row is not None else {}
+
+
+def pending_claims() -> list[dict]:
+    """Payment claims the operator has not handled yet, oldest first."""
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT telegram_id, telegram_username, sender_name, claimed_paid_at "
+            "FROM waitlist WHERE claimed_paid_at IS NOT NULL "
+            "AND resolved_at IS NULL ORDER BY claimed_paid_at ASC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def resolve_claim(telegram_id) -> None:
+    """Mark a claim handled, so it leaves the operator's pending list."""
+    with _connect() as connection:
+        connection.execute(
+            "UPDATE waitlist SET resolved_at = CURRENT_TIMESTAMP "
+            "WHERE telegram_id = ?",
+            (int(telegram_id),),
+        )
+
+
+def stats() -> dict:
+    """Counts behind the launch-demand decision.
+
+    ``payers`` is lifetime: a lapsed plan clears the allowance but not the
+    ``purchases`` counter, so conversion still counts everyone who ever paid.
+    """
+    with _connect() as connection:
+        def count(sql: str) -> int:
+            return int(connection.execute(sql).fetchone()[0] or 0)
+
+        return {
+            "users": count("SELECT COUNT(*) FROM users"),
+            "collectors": count(
+                "SELECT COUNT(DISTINCT telegram_id) FROM searches "
+                "WHERE telegram_id IS NOT NULL"
+            ),
+            "dossiers": count("SELECT COUNT(*) FROM searches"),
+            "waitlist": count("SELECT COUNT(*) FROM waitlist"),
+            "claims": count(
+                "SELECT COUNT(*) FROM waitlist WHERE claimed_paid_at IS NOT NULL"
+            ),
+            "pending": count(
+                "SELECT COUNT(*) FROM waitlist WHERE claimed_paid_at IS NOT NULL "
+                "AND resolved_at IS NULL"
+            ),
+            "payers": count("SELECT COUNT(*) FROM users WHERE purchases > 0"),
+            "active_paid": count(
+                "SELECT COUNT(*) FROM users WHERE paid_searches_left > 0"
+            ),
+        }
 
 
 def meta_get(key: str, default: str = "") -> str:

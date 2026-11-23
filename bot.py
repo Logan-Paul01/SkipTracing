@@ -17,7 +17,12 @@ import time
 
 import telebot
 from telebot.apihelper import ApiTelegramException
-from telebot.types import ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telebot.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 import access
 import config
@@ -54,8 +59,10 @@ WELCOME_TEXT = (
     "2. Phone number\n"
     "3. Gender\n"
     "4. Company (optional)\n\n"
-    f"{access.welcome_line()}\n\n"
-    "Only public profiles are searched. The bot never messages or calls "
+    f"{access.welcome_line()}\n"
+    "/plan shows what is left, /premium how to pay.\n\n"
+    "Only public profiles are searched. The number is used to match "
+    "profiles, never as a search query, and the bot never messages or calls "
     "anyone.\n"
     "/cancel stops the current trace."
 )
@@ -134,6 +141,9 @@ def cmd_trace(message):
     # Checked here, before four steps are collected, so a user never fills in a
     # whole form only to be told they cannot run it.
     if not access.can_search(uid):
+        # Reaching the paywall is the demand signal, so it is recorded before
+        # the text goes out.
+        _join_waitlist(uid, message.from_user)
         bot.send_message(message.chat.id, access.paywall(uid), parse_mode="HTML")
         return
     STATE[uid] = _new_state()
@@ -158,6 +168,253 @@ def cmd_skip(message):
     state["company"] = ""
     state["step"] = "idle"
     _run_and_reply(message, state)
+
+
+def _join_waitlist(uid: int, user) -> None:
+    """Record paid-plan interest; a waitlist write must never break a reply."""
+    try:
+        access.join_waitlist(uid, getattr(user, "username", "") or "")
+    except Exception:  # noqa: BLE001 - demand tracking is not critical path
+        logger.warning("Waitlist write failed for telegram_id=%s", uid, exc_info=True)
+
+
+@bot.message_handler(commands=["plan"])
+def cmd_plan(message):
+    """The collector's own plan and remaining searches."""
+    uid = message.from_user.id
+    db.touch_user(uid, getattr(message.from_user, "username", "") or "")
+    _reset(uid)
+    bot.send_message(message.chat.id, access.plan_text(uid), parse_mode="HTML")
+
+
+@bot.message_handler(commands=["premium"])
+def cmd_premium(message):
+    """The paid plan and how to pay it, available at any time."""
+    uid = message.from_user.id
+    db.touch_user(uid, getattr(message.from_user, "username", "") or "")
+    _reset(uid)
+    _join_waitlist(uid, message.from_user)
+    account = access.status(uid)
+    if account["paid_left"]:
+        text = access.receipt(uid)
+    else:
+        text = access.offer()
+    bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["paid"])
+def cmd_paid(message):
+    """The collector has transferred the plan price; collect the proof."""
+    uid = message.from_user.id
+    username = getattr(message.from_user, "username", "") or ""
+    db.touch_user(uid, username)
+
+    if access.status(uid)["paid_left"]:
+        _reset(uid)
+        bot.send_message(message.chat.id, access.receipt(uid), parse_mode="HTML")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    proof = parts[1].strip() if len(parts) > 1 else ""
+    if proof:
+        _submit_payment_proof(message, proof)
+        return
+
+    STATE[uid] = _new_state()
+    STATE[uid]["step"] = "proof"
+    bot.send_message(
+        message.chat.id,
+        "🧾 <b>Confirming your payment</b>\n\n"
+        "Send the <b>sender name</b> exactly as it appears on the transfer "
+        "(for example: <i>ADEBAYO TUNDE</i>). A receipt screenshot works "
+        "too.\n\n"
+        "/cancel to stop.",
+        parse_mode="HTML",
+    )
+
+
+def _submit_payment_proof(message, sender_name: str, photo_id: str = "") -> None:
+    """Record the claim, thank the collector, hand it to the operator."""
+    uid = message.from_user.id
+    username = getattr(message.from_user, "username", "") or ""
+    db.touch_user(uid, username)
+    _reset(uid)
+
+    try:
+        first = access.claim_payment(uid, sender_name)
+    except Exception:  # noqa: BLE001 - never lose the acknowledgement
+        logger.warning("Payment claim write failed for telegram_id=%s", uid, exc_info=True)
+        first = False
+
+    bot.send_message(
+        message.chat.id,
+        "✅ <b>Received.</b>\n\nYour payment is with the operator for "
+        "confirmation. Premium is switched on as soon as it clears — you will "
+        "get a message here.",
+        parse_mode="HTML",
+    )
+    _notify_owner_of_claim(uid, username, sender_name, first, photo_id)
+
+
+def _claim_card(uid: int, username: str, sender_name: str, first: bool = True):
+    """The one card the operator decides on: details plus two buttons."""
+    label = f"@{username}" if username else "no username"
+    text = (
+        "💳 <b>Payment claim</b>\n"
+        f"{html.escape(label)} · <code>{uid}</code>\n"
+        f"Sender: <b>{html.escape(sender_name or 'not given')}</b>\n"
+        f"Plan: ₦{access.PLAN_PRICE_NGN:,} · {access.PLAN_DAYS} days · "
+        f"{access.PLAN_SEARCHES} searches"
+    )
+    if not first:
+        text += "\n<i>Repeat claim</i>"
+
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("✅ Activate", callback_data=f"act:{uid}"),
+        InlineKeyboardButton("❌ Not found", callback_data=f"rej:{uid}"),
+    )
+    return text, markup
+
+
+def _notify_owner_of_claim(
+    uid: int, username: str, sender_name: str, first: bool, photo_id: str = ""
+) -> None:
+    """Send the claim card to the operator, if there is one yet."""
+    owner = access.owner_id()
+    if not owner or owner == uid:
+        logger.warning(
+            "Payment claim stored for telegram_id=%s but no operator is set to "
+            "review it; it stays pending until ownership is claimed",
+            uid,
+        )
+        return
+
+    text, markup = _claim_card(uid, username, sender_name, first)
+    try:
+        if photo_id:
+            # The receipt is forwarded by file id: nothing is downloaded or
+            # stored, and the operator sees exactly what the buyer sent.
+            bot.send_photo(
+                owner,
+                photo_id,
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        else:
+            bot.send_message(owner, text, parse_mode="HTML", reply_markup=markup)
+    except Exception:  # noqa: BLE001 - the owner may have blocked the bot
+        logger.warning(
+            "Could not notify the owner about a payment claim; it stays pending"
+        )
+
+
+def _resend_pending_claims(owner_id: int) -> None:
+    """Deliver claims that arrived before anyone owned the command.
+
+    A payment must never be lost because the operator had not set up
+    /broadcast yet: the claim is already in the database, so claiming
+    ownership is enough to see it.
+    """
+    try:
+        claims = db.pending_claims()
+    except Exception:  # noqa: BLE001 - review is best effort
+        logger.warning("Could not read pending payment claims", exc_info=True)
+        return
+
+    delivered = 0
+    for claim in claims:
+        text, markup = _claim_card(
+            int(claim["telegram_id"]),
+            claim.get("telegram_username") or "",
+            claim.get("sender_name") or "",
+        )
+        try:
+            bot.send_message(
+                owner_id, text, parse_mode="HTML", reply_markup=markup
+            )
+            delivered += 1
+        except Exception:  # noqa: BLE001 - stop quietly, they stay pending
+            logger.warning("Could not resend a pending payment claim")
+            break
+    if delivered:
+        logger.info("Resent %s pending payment claim(s) to the operator", delivered)
+
+
+@bot.callback_query_handler(
+    func=lambda call: (call.data or "").split(":", 1)[0] in {"act", "rej"}
+)
+def handle_payment_decision(call):
+    """Owner-only: switch Premium on, or close the claim as not found."""
+    if not access.is_owner(call.from_user.id):
+        bot.answer_callback_query(call.id, "This is the operator's decision.")
+        return
+
+    action, _, raw = (call.data or "").partition(":")
+    try:
+        uid = int(raw)
+    except ValueError:
+        bot.answer_callback_query(call.id, "Bad claim.")
+        return
+
+    row = db.waitlist_row(uid)
+    if row.get("resolved_at"):
+        bot.answer_callback_query(call.id, "Already handled.")
+        return
+
+    if action == "act":
+        access.grant_plan(uid)
+        db.resolve_claim(uid)
+        try:
+            bot.send_message(
+                uid,
+                "⭐ <b>SkipTrace Premium is active</b>\n\n"
+                f"{access.PLAN_SEARCHES} dossiers over {access.PLAN_DAYS} days.\n"
+                f"{access.receipt(uid)}\n\nSend /trace to run your next one.",
+                parse_mode="HTML",
+            )
+        except Exception:  # noqa: BLE001 - the buyer may have blocked the bot
+            logger.warning("Could not notify telegram_id=%s of activation", uid)
+        bot.answer_callback_query(call.id, "Activated")
+    else:
+        db.resolve_claim(uid)
+        try:
+            bot.send_message(
+                uid,
+                "We could not find that transfer yet. If you have paid, send "
+                "/paid again with the sender name on the receipt, or check the "
+                "account details with /premium.",
+            )
+        except Exception:  # noqa: BLE001 - a dead chat must not break the run
+            pass
+        bot.answer_callback_query(call.id, "Marked as not found")
+
+    try:
+        bot.edit_message_reply_markup(
+            call.message.chat.id, call.message.message_id, reply_markup=None
+        )
+    except Exception:  # noqa: BLE001 - an old card may be too old to edit
+        pass
+    logger.info(
+        "Payment claim telegram_id=%s %s by owner %s",
+        uid,
+        "activated" if action == "act" else "rejected",
+        call.from_user.id,
+    )
+
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats(message):
+    """Hidden operator command: usage and paid-conversion counters."""
+    if not access.is_owner(message.from_user.id):
+        bot.send_message(message.chat.id, UNKNOWN_COMMAND)
+        return
+    bot.send_message(
+        message.chat.id,
+        access.stats_text() + access.pending_claims_text(),
+        parse_mode="HTML",
+    )
 
 
 def _broadcast(chat_id: int, owner_id: int, body: str) -> None:
@@ -228,6 +485,9 @@ def cmd_broadcast(message):
             bot.send_message(message.chat.id, UNKNOWN_COMMAND)
             return
         logger.info("Broadcast ownership claimed by telegram_id=%s", uid)
+        # Claims filed before this moment had nobody to go to; hand them over
+        # now instead of leaving a paying collector waiting.
+        _resend_pending_claims(uid)
 
     _reset(uid)
     db.touch_user(uid, getattr(message.from_user, "username", "") or "")
@@ -262,6 +522,17 @@ def handle_text(message):
     if state and state.get("step") == "broadcast" and access.is_owner(uid):
         _reset(uid)
         _broadcast(message.chat.id, uid, text)
+        return
+
+    if state and state.get("step") == "proof":
+        if len(text) < 2:
+            bot.send_message(
+                message.chat.id,
+                "Send the sender name on the transfer (at least 2 characters), "
+                "or /cancel to stop.",
+            )
+            return
+        _submit_payment_proof(message, text)
         return
 
     if not state or state.get("step") in (None, "idle"):
@@ -335,6 +606,21 @@ def handle_text(message):
     bot.send_message(message.chat.id, "Send /trace to start a new search.")
 
 
+@bot.message_handler(content_types=["photo"])
+def handle_photo(message):
+    """A transfer receipt can stand in for the typed sender name."""
+    uid = message.from_user.id
+    db.touch_user(uid, getattr(message.from_user, "username", "") or "")
+    state = STATE.get(uid)
+    if state and state.get("step") == "proof":
+        _submit_payment_proof(message, "", message.photo[-1].file_id)
+        return
+    bot.send_message(
+        message.chat.id,
+        "Send /trace to start a search, or /paid if you have already paid.",
+    )
+
+
 async def run_search(uid, user_input) -> tuple[str, list[dict]]:
     """Run the full lookup pipeline and return (dossier_text, matches)."""
     name = user_input.get("name") or ""
@@ -352,7 +638,7 @@ async def run_search(uid, user_input) -> tuple[str, list[dict]]:
     if mode in ("auto", "web") and websearch.provider() is not None:
         # Fast path: a real web search returns pages plus a grounded answer in
         # seconds. Fall through to the curated checks only if it finds nothing.
-        hits, answer = await websearch.search_subject(name, company, phone_variants)
+        hits, answer = await websearch.search_subject(name, company)
         web_hits = len(hits)
         profiles_by_url = {
             hit["url"]: {
@@ -477,6 +763,13 @@ def main() -> None:
         raise SystemExit(1)
 
     db.init_db()
+
+    if not access.owner_id():
+        logger.warning(
+            "No operator set: /broadcast and /stats are unclaimed and payment "
+            "claims cannot be delivered. Send /broadcast once from the "
+            "operator account to claim it, or set OWNER_ID."
+        )
 
     try:
         me = bot.get_me()

@@ -40,7 +40,7 @@ handful of curated public-profile checks.
 | `extract.py` | Structured person/company fields pulled from the answer, the pages and the company site |
 | `scorer.py` | Auditable per-page confidence score and the report threshold |
 | `formatter.py` | Dossier layout, clipping and length trimming |
-| `access.py` | Free-search allowance, paywall, payment seam, `/broadcast` owner |
+| `access.py` | Free-search allowance, waitlist and manual-payment offer, usage stats, `/broadcast` owner |
 | `db.py` | SQLite audit log (`searches`, `matches`), accounts (`users`), `meta` |
 
 ## Dossier layout
@@ -83,7 +83,7 @@ Suggested next action: one line derived from the top match's reasons
 The message is capped at 3,900 characters: if it overruns, whole profile blocks
 are dropped from the bottom rather than slicing HTML mid-tag.
 
-## Free searches and payment
+## Free searches and the paid-plan waitlist
 
 Every account gets **5 free searches**. After that, **SkipTrace Premium** is
 **₦200 for 30 days**, carrying up to **20 dossiers**. `FREE_SEARCHES`,
@@ -98,12 +98,29 @@ a code change.
   left.` or `⭐ Premium · 18 of 20 searches left · renews 21 Dec.`).
 - A plan is a 30-day pass, not an auto-renewing subscription. When it lapses
   the leftover searches go with it; a renewal starts a clean 20.
-- **No payment provider is connected yet.** The paywall says so. When one is
-  added, `access.grant_plan(telegram_id)` is the only call needed after a
-  confirmed ₦200 payment. Manual activation:
-  `python3 -c "import access; access.grant_plan(123456789)"`.
+- **Payment is manual, and the paid plan is a waitlist for now.** Reaching the
+  paywall or sending `/premium` adds the account to the `waitlist` table and
+  shows the offer with the bank, account name and account number read from
+  `PAYMENT_BANK`, `PAYMENT_ACCOUNT_NAME` and `PAYMENT_ACCOUNT_NUMBER`. The
+  collector transfers ₦200 and sends `/paid`, which asks for the **sender
+  name** on the transfer (a receipt screenshot is accepted too). The claim
+  reaches the operator as one card — username, Telegram ID, sender name — with
+  **✅ Activate** and **❌ Not found** buttons. One tap grants the plan and
+  tells the buyer it is live. No payment provider is integrated:
+  `access.grant_plan(telegram_id)` is the only seam one needs, and the button
+  simply calls it.
+- **Demand is tracked.** `/paid` flags the first payment claim per account, and
+  the hidden owner command `/stats` reports accounts, collectors who ran a
+  trace, dossiers delivered, waitlist size, payment claims, paid accounts
+  (lifetime) and the paid conversion rate. The launch rule: 30% of accounts
+  paying ₦200 before the price moves and a bigger feature is added.
+- **A claim is never lost.** A payment filed before the operator has claimed
+  ownership stays pending and is delivered the moment `/broadcast` is claimed;
+  `/stats` lists anything still waiting with its sender name and ID.
+- `users.purchases` is never reset, so a lapsed plan still counts in the
+  lifetime paid figure.
 
-Why 20 rather than 50: a trace with a company is seven Exa requests (about
+Why 20 rather than 50: a trace with a company is six Exa requests (about
 $0.05, ₦70), so 50 searches would cost roughly ₦3,500 in API credits against
 ₦200 of revenue. Exa's free monthly credit (about 200 company traces) carries
 the launch; 20 per plan keeps ten paying users inside it.
@@ -168,7 +185,11 @@ collector reads.
   `"company" facebook OR instagram OR twitter OR linkedin page` query
 - without one: `"name" Nigeria`
 - always: `"name" linkedin OR facebook OR instagram profile`
-- the first phone variant with 10+ digits, quoted
+
+The debtor's phone number is **never sent as a search query**. A number is not
+indexed against a person, so the query returns directories and tutorials rather
+than a profile, and each wasted query spends credits; the number is still used
+to derive handle candidates and to score pages that mention it.
 
 A separate grounded-answer prompt asks for job title, employer, city, email,
 mobile/WhatsApp number and profile URLs, then the company's description,
@@ -201,6 +222,14 @@ profile. Only profile hosts (LinkedIn, Facebook, Instagram, TikTok, X, YouTube,
 Nairaland, GitHub) have a handle read from the URL; taking the first path
 segment of any URL yields words like `reference` or `software`.
 
+Similarity is the share of the subject's name the page carries: each of the
+subject's name tokens is matched against the page title (a token counts from
+0.80 Jaro-Winkler) and the average is taken over the subject's tokens only. A
+job title or site suffix in the title — `Chinedu Okafor - Engineer |
+LinkedIn` — therefore no longer dilutes a correct name, which it did before: it
+scored 0.50 and was thrown away. A page carrying only the surname scores 0.5
+and still stays out of the dossier.
+
 ## Scoring
 
 Deterministic and reproducible: every point comes from a named rule and each
@@ -209,7 +238,7 @@ rule that fires appends a human-readable reason. No model calls.
 | Signal | Points |
 |---|---|
 | Public page or profile exists | +10 |
-| Name similarity (order-independent, handles split on dots/underscores) | up to +30 |
+| Name similarity (share of the subject's name on the page, order-independent, handles split on dots/underscores) | up to +30 |
 | Handle *is* the debtor's phone number | +35 |
 | Phone number appears in page text or bio | +25 |
 | Gender matches | +10 |
@@ -268,10 +297,13 @@ it, send `/start`, and send `/trace` to run a search:
 - `/start` — welcome text and the free-search allowance
 - `/trace` — start a trace (name → phone → gender → company)
 - `/skip` — accept an empty company at step 4
+- `/plan` — remaining searches and which plan the account is on
 - `/cancel` — reset the conversation (also stops a `/broadcast` draft)
+- `/premium` — the ₦200 offer, the account to pay, and a waitlist place
+- `/paid` — the collector has transferred; asks for the sender name and sends the claim to the operator
 
-`/broadcast` exists but is deliberately undocumented in the bot: see
-[Operator broadcast](#operator-broadcast).
+`/broadcast` and `/stats` exist but are deliberately undocumented in the bot:
+see [Operator broadcast](#operator-broadcast).
 
 A `.env` file is read automatically if it sits next to `bot.py` (git-ignored,
 loaded at import, never overriding a variable that is already exported):
@@ -300,7 +332,10 @@ EXA_API_KEY=your_exa_key
 | `PLAN_PRICE_NGN` | `200` | Launch plan price shown in the paywall |
 | `PLAN_SEARCHES` | `20` | Dossiers included in one plan period |
 | `PLAN_DAYS` | `30` | Length of one plan period |
-| `OWNER_ID` | — | Optional: locks `/broadcast` to one account |
+| `OWNER_ID` | — | Optional: locks `/broadcast` and `/stats` to one account |
+| `PAYMENT_BANK` | — | Bank printed in the Premium offer |
+| `PAYMENT_ACCOUNT_NAME` | — | Account name printed in the Premium offer |
+| `PAYMENT_ACCOUNT_NUMBER` | — | Account number printed in the Premium offer |
 
 Tuning constants live in `config.py`: `WEB_MAX_RESULTS=8`,
 `WEB_HIGHLIGHT_CHARS=600`, `WEB_SEARCH_TIMEOUT=12`,

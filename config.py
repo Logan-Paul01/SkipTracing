@@ -71,6 +71,14 @@ PLAN_DAYS = max(1, _int_env("PLAN_DAYS", 30))
 # configured anywhere. Set it only to lock the command to a known account.
 OWNER_ID = os.environ.get("OWNER_ID", "").strip()
 
+# Manual payment for SkipTrace Premium. No payment provider is connected: the
+# collector transfers to this account and the operator activates the plan by
+# hand, so these values are only printed in the offer text. Leave them empty
+# and the bot tells the user the operator will send the details instead.
+PAYMENT_BANK = os.environ.get("PAYMENT_BANK", "").strip()
+PAYMENT_ACCOUNT_NAME = os.environ.get("PAYMENT_ACCOUNT_NAME", "").strip()
+PAYMENT_ACCOUNT_NUMBER = os.environ.get("PAYMENT_ACCOUNT_NUMBER", "").strip()
+
 # "auto"/"web" uses Tavily or Exa when a key is set, and the curated profile
 # checks when it is not. "http" forces the curated checks: a fast smoke test,
 # or a network where the profile sites block the host.

@@ -23,7 +23,7 @@ lookups, BVN/NIN data.
 |---|---|
 | `bot.py` | Telebot handlers, the 4-step conversation, the pipeline call, the hidden `/broadcast`, plain-text fallback when Telegram rejects HTML |
 | `config.py` | Every runtime setting and tunable, from env or an optional `.env` |
-| `access.py` | Per-account search allowance, the paywall text, the payment seam, and the `/broadcast` owner |
+| `access.py` | Per-account search allowance, the waitlist and manual-payment offer, `/stats` counters, and the `/broadcast` owner |
 | `db.py` | SQLite: `searches`/`matches` audit log, `users` accounts, `meta` key/value |
 | `normalizer.py` | Nigerian phone parsing → E.164, digit variants, carrier/region metadata |
 | `names.py` | Rule-based + soundex/metaphone/nysiis handle candidates |
@@ -41,9 +41,9 @@ live on this host; it is not part of the project.
 ## Running it
 
 ```bash
-cd /workspace/chats/c1834984ec767b84dbb7acc0
+cd <project directory>
 set -a && . "$HOME/.cache/freebuff-project/secrets.env" && set +a
-setsid nohup env PYTHONPATH=custom_venv python3 -u bot.py >> bot.log 2>&1 & echo $! > .bot.pid
+setsid nohup custom_venv/bin/python -u bot.py >> bot.log 2>&1 < /dev/null & echo $! > .bot.pid
 ```
 
 - Logs: `bot.log` (line 1 of a healthy start is `Authenticated as @AkipTrace_bot`).
@@ -70,10 +70,16 @@ trace; a write failure is logged and never breaks the dossier.
 | `free_searches_used` | Incremented per delivered dossier |
 | `paid_searches_left` | Dossiers left in the current plan (or granted credits); spent before free searches |
 | `plan`, `plan_expires_at` | `premium` and the end of the 30-day period; a lapsed plan is cleared before the quota is read |
+| `purchases` | Lifetime count of plans started; never reset, so conversion still counts a lapsed payer | `waitlist` — one row per account that reached the paywall or sent `/premium`:
+`telegram_id`, `telegram_username`, `created_at`, `claimed_paid_at`, 
+`sender_name` (as typed by the buyer, or empty for a screenshot), `resolved_at`
+(set when the operator activates or rejects the claim). This is the demand list:
+it shows how many collectors got as far as being asked to pay, and
+`db.pending_claims()` lists the ones still waiting for a decision.
 
 `meta` — `owner_id` is stored here after the first `/broadcast`.
 
-## Search allowance and payment
+## Search allowance, waitlist and manual payment
 
 Current policy: **5 free searches per account, then SkipTrace Premium — ₦200
 for 30 days, up to 20 dossiers.** All four numbers are environment variables
@@ -84,26 +90,56 @@ auto-renewing subscription until billing exists.
 Flow in `bot.py`:
 
 1. `/trace` calls `access.can_search(uid)` **before** asking for the four
-   inputs. No allowance → paywall text, no conversation started.
+   inputs. No allowance → the account joins the waitlist and gets the paywall,
+   and no conversation starts.
 2. `_run_and_reply` calls `access.charge(uid)` **after** the dossier is sent.
    A failed search costs nothing, because the charge only happens on success.
 3. A one-line receipt follows each dossier (`🎟 4 of 5 free searches left.`).
+4. `/plan` repeats that accounting on demand: free searches used and left on
+   the free plan, or plan searches left plus the period end on Premium (and any
+   free searches still in hand). Owner accounts are told searches are not
+   counted.
 
-**No payment provider is connected.** `access.grant_plan(uid)` is the only seam
-a payment integration needs: confirm the ₦200 payment, call it, and the existing
-quota logic spends the allowance. Activating by hand:
+**The paid plan is a waitlist with manual payment; no provider is connected.**
+`/premium` (and the paywall) prints the offer plus the bank, account name and
+account number from `PAYMENT_BANK`, `PAYMENT_ACCOUNT_NAME` and
+`PAYMENT_ACCOUNT_NUMBER` — never hardcoded, so the account can change with the
+server's secrets. The collector transfers ₦200 and sends `/paid`, which asks for
+the **sender name** on the transfer; a receipt screenshot is accepted in the same
+state (forwarded to the owner by file id, never downloaded or stored).
+
+That claim arrives as one card for the operator:
+
+```
+💳 Payment claim
+@collector · 123456789
+Sender: ADEBAYO TUNDE
+Plan: ₦200 · 30 days · 20 searches
+[✅ Activate] [❌ Not found]
+```
+
+**✅ Activate** calls `access.grant_plan(uid)`, marks the claim resolved, and
+messages the buyer `⭐ SkipTrace Premium is active`. **❌ Not found** closes the
+claim and asks the buyer to resend the sender name. Buttons only respond to the
+owner; anyone else gets "This is the operator's decision." A handled claim cannot
+be activated twice.
+
+The same activation by hand, if a card is lost:
 
 ```bash
 python3 -c "import db, access; db.init_db(); access.grant_plan(123456789)"
 python3 -c "import db; [print(u) for u in db.all_users()]"   # find the ID
+python3 -c "import db; [print(c) for c in db.pending_claims()]"   # waiting claims
 ```
 
-`access.grant_searches(uid, n)` adds plain credits with no period, for a
-goodwill top-up.
+`access.grant_plan` also increments `users.purchases`, so a lapsed plan still
+counts as a payer. `access.grant_searches(uid, n)` adds plain credits with no
+period, for a goodwill top-up, and does not count as a purchase.
+
+Demand gate: the offer stays at ₦200 until **30% of accounts have paid**, then
+the price moves to ₦500 together with a new feature. `/stats` is the readout.
 
 The owner (see below) is exempt from the quota so the bot can always be tested.
-
-The commercial shape is recorded under "Open decisions" at the end.
 
 ## Hidden operator command: /broadcast
 
@@ -118,6 +154,32 @@ The commercial shape is recorded under "Open decisions" at the end.
 - Rate limiting: 0.05 s between sends (~20/s, under Telegram's ~30/s), a 3 s
   pause on HTTP 429, and a progress edit every 25 recipients.
 - A blocked user or a dead chat counts as `Failed` and does not stop the run.
+
+### Operator stats: /stats
+
+`/stats` is owner-only and hidden like `/broadcast`: anyone else gets the
+ordinary unknown-command text. It reports accounts, collectors who ran a trace,
+dossiers delivered, waitlist size, payment claims, paid accounts (lifetime), paid
+accounts with an allowance now, and the conversion percentage against the 30%
+go/no-go line. Below the counters it lists every claim still waiting, with the
+sender name and ID, so a card that was scrolled past can still be acted on.
+
+A payment that arrives before the operator has claimed ownership is not lost:
+the claim is stored, and claiming `/broadcast` immediately re-sends every
+waiting claim as a card. Until then the bot logs a warning on startup that no
+operator is set.
+
+```
+📊 SkipTrace usage
+Accounts: 12
+Collectors who ran a trace: 9
+Dossiers delivered: 40
+On the waitlist: 5
+Said they paid: 2
+Paid accounts (ever): 2
+Paid accounts with an allowance now: 2
+Conversion: 16.7% of accounts (go/no-go: 30%)
+```
 
 Ownership, without configuring a Telegram ID:
 
@@ -160,7 +222,7 @@ Offline pipeline smoke test (no Telegram, no keys needed for the fallback path):
 ```bash
 python3 - <<'PY'
 import asyncio, websearch, scorer, formatter
-hits, answer = asyncio.run(websearch.search_subject("Ayodeji Ibrahim Balogun", "Musician", ["9029327067"]))
+hits, answer = asyncio.run(websearch.search_subject("Ayodeji Ibrahim Balogun", "Musician"))
 ctx = {"name": "Ayodeji Ibrahim Balogun", "gender": "Male", "company": "Musician",
        "phone_e164": "+2349029327067", "phone_variants": ["9029327067"], "meta": {}}
 profiles = {h["url"]: {"display_name": h.get("title", ""), "bio": h.get("snippet", "")} for h in hits}
@@ -211,6 +273,9 @@ Worker process only: no port, no webhook, no inbound traffic.
   bug degrades instead of losing the dossier.
 - `config.BOT_TOKEN` falls back to the secret name `Skiptracingbotkey`.
 - Exa is the default provider; only `EXA_API_KEY` is live in this workspace, so every trace here runs on Exa.
+- The debtor's number is never used as a search query: it only builds handle
+  candidates and scores pages that mention it, so a trace spends no credit on
+  it.
 - `generalgasng.com` was unreachable from this VM once, so that test subject's
   company address/email came back partial. The host fetch is capped at 3 s per
   page and skipped for 10 minutes after a failure.
@@ -220,12 +285,14 @@ Worker process only: no port, no webhook, no inbound traffic.
 
 ## Open decisions
 
-1. **Launch pricing** — ₦200 / 30 days / 20 searches is the demand test. It is
-   deliberately inside the free Exa credit; at paid API rates (≈₦70 per company
-   trace) the worst case costs more than the price. When the free credit runs
-   out, either raise the price (₦500 for 50, ₦1,000 for 120) or cut the
-   per-trace query count. 50 searches at ₦200 would burn the whole monthly
-   credit with about four subscribers.
-2. **Payment provider** — none chosen; `access.grant_plan` is the seam.
+1. **Launch pricing** — ₦200 / 30 days / 20 searches is the demand test, sold
+   through the waitlist with a manual transfer. It is deliberately inside the
+   free Exa credit; at paid API rates (≈₦70 per company trace) the worst case
+   costs more than the price. Go/no-go: 30% of accounts paying, read from
+   `/stats`. If it passes, move to ₦500 with a new feature. If the free credit
+   runs out first, cut the per-trace query count as well as raising the price.
+2. **Payment provider** — none; manual transfer plus `/paid` and
+   `access.grant_plan`. A provider can replace the transfer later without
+   touching the quota logic.
 3. **Ranking quality** — namesake profiles with a different surname still leak
    into the top matches, and `extract.collect` can attribute a namesake's email.
