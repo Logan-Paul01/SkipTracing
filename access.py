@@ -1,6 +1,6 @@
 """Search allowance per account, the paid-plan waitlist and /broadcast owner.
 
-Every account gets ``FREE_SEARCHES`` dossiers (5 by default). After that it
+Every account gets ``FREE_SEARCHES`` dossiers (10 by default). After that it
 needs SkipTrace Premium: ``PLAN_PRICE_NGN`` (₦200) for ``PLAN_DAYS`` (30) days,
 which carries ``PLAN_SEARCHES`` (20) dossiers.
 

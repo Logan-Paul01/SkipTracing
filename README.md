@@ -39,7 +39,8 @@ handful of curated public-profile checks.
 | `searcher.py` | Curated public-profile checks (TikTok, Facebook, LinkedIn, GitHub, Nairaland), used only when no search key is set |
 | `extract.py` | Structured person/company fields pulled from the answer, the pages and the company site |
 | `scorer.py` | Auditable per-page confidence score and the report threshold |
-| `formatter.py` | Dossier layout, clipping and length trimming |
+| `formatter.py` | Dossier layout, the profiles view, clipping and length trimming |
+| `banks.py` | Published bank-account details for the "Associated banks" view |
 | `access.py` | Free-search allowance, waitlist and manual-payment offer, usage stats, `/broadcast` owner |
 | `db.py` | SQLite audit log (`searches`, `matches`), accounts (`users`), `meta` |
 
@@ -72,20 +73,34 @@ Sources scanned    N public pages (or variations tested in fallback mode)
    Company, About (one sentence), Website, Address, Phone(s), Email(s), socials
    "No company supplied and none named in the sources." when there is none
 
-🏅 Top matching profiles
-   🥇 Site — score/100, display name, quoted snippet, URL, ✔ reasons
-   Three blocks when the dossier already carries structured contact or company
-   data, eight when the evidence is thin.
+🏅 N matching profiles — open them with the button below
 
 Suggested next action: one line derived from the top match's reasons
 ```
 
-The message is capped at 3,900 characters: if it overruns, whole profile blocks
-are dropped from the bottom rather than slicing HTML mid-tag.
+Under the message sit two stacked inline buttons. Tapping one **edits the same
+message** — nothing new is sent, so a collector's chat does not fill up with
+screenshots of the same trace:
+
+- **🏅 Top matching profiles** — 🥇 Site — score/100, display name, quoted
+  snippet, URL and reasons. Three cards when the dossier already carries
+  structured contact or company data, eight when the evidence is thin.
+- **🏦 Associated banks** — bank accounts this person or company published on a
+  public page (`Account number: 2045678931 GTBank`), with the source link. The
+  tab is built on demand: it scans the pages the trace already returned and
+  then runs one extra targeted search.
+- **⬅️ Back to dossier** — returns to the main view with both buttons again.
+
+A view only opens for the account that ran the trace; anyone else is told the
+dossier is not theirs. Views live in memory for six hours, so after a restart
+an old button says the dossier has expired.
+
+The main message is capped at 3,900 characters, and the profiles view drops
+whole cards from the bottom rather than slicing HTML mid-tag.
 
 ## Free searches and the paid-plan waitlist
 
-Every account gets **5 free searches**. After that, **SkipTrace Premium** is
+Every account gets **10 free searches**. After that, **SkipTrace Premium** is
 **₦200 for 30 days**, carrying up to **20 dossiers**. `FREE_SEARCHES`,
 `PLAN_PRICE_NGN`, `PLAN_SEARCHES` and `PLAN_DAYS` change those numbers without
 a code change.
@@ -94,7 +109,12 @@ a code change.
   for a search they cannot run.
 - A search is charged only after its dossier has been delivered: a failed
   search costs nothing.
-- Each dossier is followed by one short receipt line (`🎟 4 of 5 free searches
+- **Nothing found costs nothing.** A trace that comes back empty (no profile
+  above the reporting floor, no contact detail, and no company address, phone,
+  website or social page) is delivered with `🟢 No public record found` and the
+  balance is left untouched. A company that exists is a finding, so the usual
+  "person not found, business found" dossier still counts.
+- Each dossier is followed by one short receipt line (`🎟 9 of 10 free searches
   left.` or `⭐ Premium · 18 of 20 searches left · renews 21 Dec.`).
 - A plan is a 30-day pass, not an auto-renewing subscription. When it lapses
   the leftover searches go with it; a renewal starts a clean 20.
@@ -328,7 +348,7 @@ EXA_API_KEY=your_exa_key
 | `ENV_FILE` | `.env` | Path read for keys when they are not exported |
 | `EXA_API_KEY` | — | Enables the Exa engine |
 | `TAVILY_API_KEY` | — | Enables the Tavily engine (Exa still wins when both are set) |
-| `FREE_SEARCHES` | `5` | Free dossiers per account |
+| `FREE_SEARCHES` | `10` | Free dossiers per account |
 | `PLAN_PRICE_NGN` | `200` | Launch plan price shown in the paywall |
 | `PLAN_SEARCHES` | `20` | Dossiers included in one plan period |
 | `PLAN_DAYS` | `30` | Length of one plan period |
@@ -370,14 +390,21 @@ webhook and no inbound traffic.
    enough now that Maigret is gone.
 2. **GitHub Integration** → repository URL, branch `main` → **Clone**. Wispbyte
    has no push webhook: after a commit, press **Pull**, then restart the server.
-3. **Startup** → command: `pip install -r requirements.txt && python bot.py`.
-4. **Startup → Server Configuration** → add `BOT_TOKEN` and `EXA_API_KEY` (or
-   `TAVILY_API_KEY`). If the egg refuses custom variables, upload a `.env` with
-   those two lines through **Files**; `config.py` reads it automatically.
+3. **Startup** → command: `bash start.sh`. The script installs the pinned
+   requirements into the server's Python and then runs `python -u bot.py`, so a
+   server that lost its packages still starts. (`pip install -r
+   requirements.txt && python bot.py` also works.)
+4. **Startup → Server Configuration** → add `BOT_TOKEN`, `EXA_API_KEY` (or
+   `TAVILY_API_KEY`), `OWNER_ID`, `PAYMENT_BANK`, `PAYMENT_ACCOUNT_NAME` and
+   `PAYMENT_ACCOUNT_NUMBER`. If the egg refuses custom variables, upload a
+   `.env` through **Files**; `config.py` reads it automatically. Leave `DB_PATH`
+   alone unless the panel puts the working directory somewhere that is wiped.
 5. Start, then watch **Console** for `Authenticated as @...`.
 
 Free servers have no SFTP, and a pull only takes effect on the next restart.
-Never run two pollers on one token: stop any other instance first.
+Never run two pollers on one token: stop any other instance first. `.env`,
+`skiptrace.db`, `bot.log`, `custom_venv/` and `__pycache__/` are git-ignored, so
+the clone the panel pulls never carries a secret or a stale audit log.
 
 ## Security and hard rules
 
@@ -429,6 +456,11 @@ C extension was never needed.
   pages; an uncommon name or an unlisted company can come back thin or empty.
 - A company site that is unreachable from the host (or down) yields no address
   or company email; the fetch is capped and then skipped for 10 minutes.
+- **A NUBAN cannot be predicted from a phone number**, and the bot never claims
+  to. The account number is issued by the bank, its check digit only validates
+  a number you already hold, and mobile prefixes no longer identify a network.
+  "Associated banks" reports only account details somebody published publicly,
+  so a subject who never posted one yields nothing.
 - The curated checks do not cover Instagram: logged-out Instagram serves a
   login page that cannot reliably distinguish a real profile, so it is skipped
   rather than reported as a match. Instagram profiles are still found through

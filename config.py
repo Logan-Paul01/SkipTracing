@@ -56,7 +56,7 @@ BOT_TOKEN = (
 DB_PATH = os.environ.get("DB_PATH", "skiptrace.db")
 
 # Free dossiers per account before the bot asks for payment.
-FREE_SEARCHES = max(0, _int_env("FREE_SEARCHES", 5))
+FREE_SEARCHES = max(0, _int_env("FREE_SEARCHES", 10))
 
 # Launch plan: one price for one period and a hard cap on dossiers. No payment
 # provider is connected yet, so these numbers only appear in the paywall.

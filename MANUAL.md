@@ -31,7 +31,8 @@ lookups, BVN/NIN data.
 | `searcher.py` | Curated profile checks, only used when no search key is set |
 | `scorer.py` | Deterministic 0–100 score per page, plus the report threshold |
 | `extract.py` | Person/company fields pulled from the answer, hits and company site |
-| `formatter.py` | The dossier itself: HTML, clipping, length trimming |
+| `formatter.py` | The dossier itself: HTML, the profiles view, clipping, length trimming, and the "did this trace find anything" rule |
+| `banks.py` | Published account details for the "Associated banks" view |
 | `MANUAL.md` | This document |
 
 `skiptrace.db`, `.env`, `bot.log`, `.bot.pid`, `custom_venv/` and `__pycache__/`
@@ -81,7 +82,7 @@ it shows how many collectors got as far as being asked to pay, and
 
 ## Search allowance, waitlist and manual payment
 
-Current policy: **5 free searches per account, then SkipTrace Premium — ₦200
+Current policy: **10 free searches per account, then SkipTrace Premium — ₦200
 for 30 days, up to 20 dossiers.** All four numbers are environment variables
 (`FREE_SEARCHES`, `PLAN_PRICE_NGN`, `PLAN_SEARCHES`, `PLAN_DAYS`), so the offer
 can change without a release. A plan is a 30-day pass rather than an
@@ -92,13 +93,27 @@ Flow in `bot.py`:
 1. `/trace` calls `access.can_search(uid)` **before** asking for the four
    inputs. No allowance → the account joins the waitlist and gets the paywall,
    and no conversation starts.
-2. `_run_and_reply` calls `access.charge(uid)` **after** the dossier is sent.
-   A failed search costs nothing, because the charge only happens on success.
-3. A one-line receipt follows each dossier (`🎟 4 of 5 free searches left.`).
+2. `_run_and_reply` calls `access.charge(uid)` **after** the dossier is sent,
+   and only when the trace actually found something. A failed search costs
+   nothing, and `formatter.findings()` decides whether an empty result is
+   charged: no profile above the reporting floor, no contact detail and no
+   company address/phone/website/social means the message carries
+   `🟢 No public record found` and the balance is untouched. A company that
+   exists is a finding, so "person not found, business found" still counts.
+3. A one-line receipt follows each dossier (`🎟 9 of 10 free searches left.`).
 4. `/plan` repeats that accounting on demand: free searches used and left on
    the free plan, or plan searches left plus the period end on Premium (and any
    free searches still in hand). Owner accounts are told searches are not
    counted.
+
+Each dossier is one message with two stacked buttons — **🏅 Top matching
+profiles** and **🏦 Associated banks** — and each opens by editing that same
+message, with **⬅️ Back to dossier** to return. Views are held in memory under
+a short token for six hours (`VIEWS` in `bot.py`), only open for the account
+that ran the trace, and old buttons say the dossier expired after a restart.
+The banks view scans the pages the trace already returned, then runs one extra
+search for published account details; it never guesses a NUBAN, because one
+cannot be derived from a phone number.
 
 **The paid plan is a waitlist with manual payment; no provider is connected.**
 `/premium` (and the paywall) prints the offer plus the bank, account name and
@@ -257,13 +272,17 @@ Worker process only: no port, no webhook, no inbound traffic.
 
 1. Technology **Python**, GitHub integration → `Logan-Paul01/SkipTracing`,
    branch `main`. Wispbyte has no push webhook: **Pull**, then restart.
-2. Startup command: `pip install -r requirements.txt && python bot.py`.
+2. Startup command: `bash start.sh` (installs `requirements.txt`, then runs
+   `python -u bot.py`). `pip install -r requirements.txt && python bot.py` also
+   works if the panel runs it as a shell line.
 3. Server Configuration → secrets: `BOT_TOKEN`, `EXA_API_KEY` (or
-   `TAVILY_API_KEY`). If custom variables are refused, upload a `.env` with
-   those lines; `config.py` reads it. Free servers have no SFTP after start.
+   `TAVILY_API_KEY`), `OWNER_ID`, `PAYMENT_BANK`, `PAYMENT_ACCOUNT_NAME`,
+   `PAYMENT_ACCOUNT_NUMBER`. If custom variables are refused, upload a `.env`
+   with those lines; `config.py` reads it. Free servers have no SFTP after
+   start.
 4. Watch the console for `Authenticated as @...`.
 5. Make sure the filesystem holding `DB_PATH` persists, otherwise the account
-   counters reset on restart and every user gets five fresh free searches.
+   counters reset on restart and every user gets ten fresh free searches.
 
 ## Gotchas
 
