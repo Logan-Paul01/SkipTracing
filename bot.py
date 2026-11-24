@@ -12,6 +12,7 @@ import asyncio
 import html
 import logging
 import re
+import secrets
 import sys
 import time
 
@@ -25,8 +26,10 @@ from telebot.types import (
 )
 
 import access
+import banks
 import config
 import db
+import extract
 import formatter
 import names
 import normalizer
@@ -106,14 +109,173 @@ def _strip_html(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
-def _send_html(chat_id: int, text: str) -> None:
+# A dossier is kept in memory under a short token so the buttons under it can
+# swap the one message between its views. Nothing is re-sent and nothing extra
+# is written to the database; a restart simply makes old buttons say so.
+VIEW_TTL = 6 * 3600
+VIEW_LIMIT = 300
+VIEWS: dict[str, dict] = {}
+
+
+def _remember_view(view: dict) -> str:
+    """Store a rendered dossier and return the token its buttons carry."""
+    now = time.time()
+    for key in [
+        key for key, item in VIEWS.items() if now - item.get("created", 0) > VIEW_TTL
+    ]:
+        VIEWS.pop(key, None)
+    while len(VIEWS) >= VIEW_LIMIT:
+        VIEWS.pop(next(iter(VIEWS)), None)
+
+    token = secrets.token_urlsafe(6)
+    view["created"] = now
+    VIEWS[token] = view
+    return token
+
+
+def _view_markup(token: str) -> InlineKeyboardMarkup:
+    """The two tabs under a dossier, one above the other."""
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(
+            "🏅 Top matching profiles", callback_data=f"pv:{token}:prof"
+        )
+    )
+    markup.add(
+        InlineKeyboardButton("🏦 Associated banks", callback_data=f"pv:{token}:bank")
+    )
+    return markup
+
+
+def _back_markup(token: str) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("⬅️ Back to dossier", callback_data=f"pv:{token}:back")
+    )
+    return markup
+
+
+def _profiles_limit(structured: dict) -> int:
+    """Fewer profile cards when the dossier already carries contacts."""
+    if structured["person"].get("phones") or structured["company"].get("website"):
+        return formatter.MATCHES_WITH_STRUCTURE
+    return formatter.MAX_MATCHES
+
+
+def _evidence_texts(hits, answer: str = "") -> list[tuple[str, str]]:
+    """The prose a viewer can scan, as (text, url) pairs."""
+    texts: list[tuple[str, str]] = [(answer or "", "")]
+    for hit in hits or ():
+        texts.append(
+            (
+                f"{hit.get('title') or ''}. {hit.get('snippet') or ''}",
+                hit.get("url") or "",
+            )
+        )
+    return texts
+
+
+def _bank_view(view: dict) -> str:
+    """The Associated banks tab, built once and then cached on the view."""
+    if view.get("banks"):
+        return view["banks"]
+
+    payload = view.get("payload") or {}
+    phone = payload.get("phone") or ""
+    name = payload.get("name") or ""
+    company = payload.get("company") or ""
+
+    accounts = banks.find_accounts(
+        _evidence_texts(payload.get("hits"), payload.get("answer") or ""),
+        ignore_digits=phone,
+    )
+
+    # One targeted search, on demand only: the pages a trace already returned
+    # sometimes name the bank but not the account, and a marketplace listing
+    # or business page is where a published account number actually lives.
+    searched = websearch.provider() is not None
+    if searched:
+        try:
+            extra_hits = asyncio.run(websearch.search_account_details(name, company))
+        except Exception:  # noqa: BLE001 - an optional tab must never crash
+            logger.warning("Account-detail search failed", exc_info=True)
+            extra_hits = []
+        accounts = banks.merge(
+            accounts,
+            banks.find_accounts(_evidence_texts(extra_hits), ignore_digits=phone),
+        )
+
+    view["banks"] = banks.format_view(
+        accounts, subject=name, company=company, searched=searched
+    )
+    return view["banks"]
+
+
+@bot.callback_query_handler(
+    func=lambda call: (call.data or "").split(":", 2)[0] == "pv"
+)
+def handle_dossier_view(call):
+    """Swap the dossier message between views instead of sending more messages."""
+    parts = (call.data or "").split(":", 2)
+    if len(parts) != 3:
+        bot.answer_callback_query(call.id, "This dossier is too old to open.")
+        return
+
+    _prefix, token, action = parts
+    view = VIEWS.get(token)
+    if not view:
+        bot.answer_callback_query(
+            call.id, "This dossier has expired — send /trace for a new one."
+        )
+        return
+    if int(call.from_user.id) != int(view.get("uid") or 0):
+        bot.answer_callback_query(call.id, "This dossier belongs to another account.")
+        return
+
+    answered = False
+    if action == "prof":
+        text, markup = view["profiles"], _back_markup(token)
+    elif action == "bank":
+        bot.answer_callback_query(
+            call.id, "Looking up published account details…"
+        )
+        answered = True
+        text, markup = _bank_view(view), _back_markup(token)
+    else:
+        text, markup = view["main"], _view_markup(token)
+
+    try:
+        bot.edit_message_text(
+            _truncate(text),
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+    except ApiTelegramException as exc:
+        if "not modified" not in str(exc).lower():
+            logger.warning("Dossier view switch failed: %s", exc)
+            bot.answer_callback_query(
+                call.id, "Could not switch the view — send /trace again."
+            )
+            return
+    if not answered:
+        bot.answer_callback_query(call.id)
+
+
+def _send_html(chat_id: int, text: str, reply_markup=None):
     """Send HTML, falling back to plain text if Telegram rejects the markup."""
     text = _truncate(text)
     try:
-        bot.send_message(chat_id, text, parse_mode="HTML")
+        return bot.send_message(
+            chat_id, text, parse_mode="HTML", reply_markup=reply_markup
+        )
     except ApiTelegramException:
         logger.warning("HTML send rejected; retrying as plain text")
-        bot.send_message(chat_id, _strip_html(text))
+        return bot.send_message(
+            chat_id, _strip_html(text), reply_markup=reply_markup
+        )
 
 
 @bot.message_handler(commands=["start"])
@@ -621,8 +783,8 @@ def handle_photo(message):
     )
 
 
-async def run_search(uid, user_input) -> tuple[str, list[dict]]:
-    """Run the full lookup pipeline and return (dossier_text, matches)."""
+async def run_search(uid, user_input) -> dict:
+    """Run the full lookup pipeline and return everything the views need."""
     name = user_input.get("name") or ""
     gender = user_input.get("gender") or ""
     company = user_input.get("company") or ""
@@ -694,6 +856,7 @@ async def run_search(uid, user_input) -> tuple[str, list[dict]]:
     except Exception:  # noqa: BLE001 - audit log must never break a search
         logger.warning("Audit log write failed", exc_info=True)
 
+    structured = extract.collect(input_ctx, answer, hits)
     dossier = formatter.format_dossier(
         input_ctx,
         matches,
@@ -702,8 +865,29 @@ async def run_search(uid, user_input) -> tuple[str, list[dict]]:
         answer=answer,
         sources_count=web_hits or None,
         hits=hits,
+        structured=structured,
     )
-    return dossier, matches
+    return {
+        "dossier": dossier,
+        "profiles": formatter.format_profiles(
+            matches, _profiles_limit(structured)
+        ),
+        "findings": formatter.findings(structured, matches),
+        "matches": matches,
+        "hits": hits,
+        "answer": answer,
+    }
+
+
+def _nothing_found_text(uid: int) -> str:
+    """Said when a trace came back empty, so the credit is clearly untouched."""
+    text = (
+        "🟢 <b>No public record found</b>\n"
+        "Nothing usable came back for this subject, so this search was "
+        "<b>not</b> taken from your balance."
+    )
+    note = access.receipt(uid)
+    return f"{text}\n\n{note}" if note else text
 
 
 def _run_and_reply(message, state) -> None:
@@ -727,7 +911,7 @@ def _run_and_reply(message, state) -> None:
         )
 
     try:
-        dossier, _matches = asyncio.run(run_search(uid, payload))
+        result = asyncio.run(run_search(uid, payload))
     except ValueError as exc:
         bot.send_message(chat_id, f"⚠️ {html.escape(str(exc))}", parse_mode="HTML")
         return
@@ -738,10 +922,37 @@ def _run_and_reply(message, state) -> None:
         )
         return
 
-    _send_html(chat_id, dossier)
+    token = _remember_view(
+        {
+            "uid": uid,
+            "chat_id": chat_id,
+            "message_id": None,
+            "main": result["dossier"],
+            "profiles": result["profiles"],
+            "banks": "",
+            "payload": {
+                "name": payload["name"],
+                "company": payload["company"],
+                "phone": payload["phone"],
+                "hits": result["hits"],
+                "answer": result["answer"],
+            },
+        }
+    )
+    sent = _send_html(
+        chat_id, result["dossier"], reply_markup=_view_markup(token)
+    )
+    if sent is not None:
+        VIEWS[token]["message_id"] = getattr(sent, "message_id", None)
 
-    # Charged only once the dossier has actually gone out, so a failed search
-    # never costs the collector a paid search.
+    # Charged only once the dossier has actually gone out *and* it came back
+    # with something usable: "nothing found" is not worth a search while the
+    # bot is still earning its first users.
+    if not result["findings"]["anything"]:
+        bot.send_message(chat_id, _nothing_found_text(uid), parse_mode="HTML")
+        logger.info("No findings for telegram_id=%s; not charged", uid)
+        return
+
     try:
         access.charge(uid)
         note = access.receipt(uid)

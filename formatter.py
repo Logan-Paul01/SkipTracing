@@ -16,6 +16,7 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+import config
 import extract
 
 MAX_MATCHES = 8
@@ -381,11 +382,19 @@ def format_dossier(
     answer: str = "",
     sources_count=None,
     hits=(),
+    structured=None,
 ) -> str:
-    """Render the dossier as Telegram-safe HTML."""
+    """Render the dossier as Telegram-safe HTML.
+
+    The ranked profiles are deliberately not in this text: the collector opens
+    them with the button under the message, so the dossier itself stays the
+    reading order that matters on a first pass (who, what the sources say,
+    contacts, company).
+    """
     input_ctx = input_ctx or {}
     matches = list(matches or [])
-    structured = extract.collect(input_ctx, answer, hits)
+    if structured is None:
+        structured = extract.collect(input_ctx, answer, hits)
 
     name = html.escape(str(input_ctx.get("name") or "Unknown"))
     # Collectors need the full number to dial it, so it is never masked here.
@@ -426,30 +435,88 @@ def format_dossier(
         body.append("No company supplied and the profile search found none.")
         body.append("")
 
-    if structured["person"].get("phones") or structured["company"].get("website"):
-        limit = MATCHES_WITH_STRUCTURE
+    found = findings(structured, matches)
+    if found["profiles"]:
+        label = "profile" if found["profiles"] == 1 else "profiles"
+        body.append(
+            f"🏅 <b>{found['profiles']} matching {label}</b> — open them with "
+            "the button below."
+        )
     else:
-        limit = MAX_MATCHES
-
-    match_blocks = _match_blocks(matches, limit)
-    if match_blocks:
-        body.append("🏅 <b>Top matching profiles</b>")
-        body.append("<i>Highest-confidence public pages first</i>")
-        body.append("")
+        body.append("🏅 No qualifying public profile found in the sources.")
+    body.append("")
 
     tail = [f"<b>Suggested next action:</b> {html.escape(_next_action(matches))}"]
 
-    def render(blocks: list[list[str]]) -> str:
-        lines: list[str] = list(body)
-        for block in blocks:
-            lines.extend(block)
-        lines.extend(tail)
+    return "\n".join(list(body) + tail)
+
+
+def findings(structured, matches) -> dict:
+    """Did this trace actually come back with something usable?
+
+    A trace costs the collector a search, so "nothing found" must not spend
+    one. A company that exists is a finding even when the person is not, and
+    so is any contact detail or any profile that clears the reporting floor;
+    a page that merely repeats the searched name is not.
+    """
+    person = (structured or {}).get("person") or {}
+    company = (structured or {}).get("company") or {}
+
+    profiles = [
+        match
+        for match in matches or ()
+        if int(match.get("score") or 0) >= config.MIN_SCORE_TO_REPORT
+    ]
+    person_found = bool(
+        person.get("phones")
+        or person.get("whatsapp")
+        or person.get("emails")
+        or person.get("socials")
+    )
+    company_found = bool(
+        company.get("about")
+        or company.get("address")
+        or company.get("phones")
+        or company.get("emails")
+        or company.get("website")
+        or company.get("socials")
+    )
+    return {
+        "profiles": len(profiles),
+        "person": person_found,
+        "company": company_found,
+        "anything": bool(profiles or person_found or company_found),
+    }
+
+
+def format_profiles(matches, limit=None) -> str:
+    """The "Top matching profiles" tab, opened from the dossier buttons."""
+    matches = list(matches or [])
+    if limit is None:
+        limit = MAX_MATCHES
+
+    lines = [
+        "🏅 <b>Top matching profiles</b>",
+        "<i>Highest-confidence public pages first</i>",
+        "",
+    ]
+
+    blocks = _match_blocks(matches, limit)
+    if not blocks:
+        lines.append(
+            "No public profile cleared the reporting floor for this subject. "
+            "A namesake's page or a company page is not the person."
+        )
         return "\n".join(lines)
 
-    text = render(match_blocks)
-    # Telegram rejects anything over 4,096 characters. Drop whole profile
-    # blocks from the bottom rather than slicing HTML mid-tag.
-    while match_blocks and len(text) > TEXT_LIMIT:
-        match_blocks.pop()
-        text = render(match_blocks)
+    def render(items: list[list[str]]) -> str:
+        body = list(lines)
+        for block in items:
+            body.extend(block)
+        return "\n".join(body)
+
+    text = render(blocks)
+    while blocks and len(text) > TEXT_LIMIT:
+        blocks.pop()
+        text = render(blocks)
     return text

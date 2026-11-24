@@ -401,6 +401,44 @@ async def _fetch_company_site(hits, company: str, answer: str = "") -> list[dict
     return pages
 
 
+async def search_account_details(name: str, company: str = "") -> list[dict]:
+    """One targeted search for account details the subject published.
+
+The query is the name and company only: a number is never a useful search
+    term, and a page that prints an account number also names its holder.
+    Called only when a collector opens the "Associated banks" tab, so a trace
+    that never opens it costs nothing extra.
+    """
+    backend = provider()
+    if backend is None:
+        return []
+
+    query = f'"{name}"'
+    if company:
+        query += f' "{company}"'
+    query += ' "account number" bank transfer'
+
+    headers = {"Content-Type": "application/json"}
+    if backend == "exa":
+        headers["x-api-key"] = config.EXA_API_KEY
+    else:
+        headers["Authorization"] = f"Bearer {config.TAVILY_API_KEY}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            if backend == "exa":
+                return await asyncio.wait_for(
+                    _exa_search(session, query, headers), timeout=config.WEB_SEARCH_TIMEOUT
+                )
+            hits, _answer = await asyncio.wait_for(
+                _tavily_search(session, query, headers), timeout=config.WEB_SEARCH_TIMEOUT
+            )
+            return hits
+    except Exception:  # noqa: BLE001 - an optional tab must never raise
+        logger.warning("Account-detail search failed", exc_info=True)
+        return []
+
+
 async def search_subject(name: str, company: str = "") -> tuple[list[dict], str]:
     """Search the open web for the subject; return (hits, grounded_answer).
 
