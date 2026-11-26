@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse
 
+import phonenumbers
+
 SOCIAL_HOSTS = {
     "linkedin.com": "LinkedIn",
     "facebook.com": "Facebook",
@@ -230,14 +232,41 @@ def _is_post_link(path: str) -> bool:
 
 
 def _norm_phone(raw: str) -> str:
+    """Format a Nigerian number, or reject the string entirely.
+
+    A page abroad prints its own local shape - a Turkish office line reads
+    "05325081900" and a UK line "0845 0573142" - and prefixing those ten
+    digits with +234 invented numbers that cannot exist. Only a string that
+    starts with the Nigerian country code or the Nigerian trunk 0 qualifies,
+    and the digits must pass libphonenumber's NG validation before they reach
+    a dossier.
+    """
     digits = re.sub(r"\D", "", str(raw or ""))
+    if digits.startswith("2340") and len(digits) == 14:
+        # "+234 (0) 803 ..." is the same number written with the trunk zero.
+        digits = "234" + digits[4:]
     if digits.startswith("234"):
-        digits = digits[3:]
+        candidate = "+" + digits
     elif digits.startswith("0"):
-        digits = digits[1:]
-    if len(digits) != 10:
+        candidate = "+234" + digits[1:]
+    else:
         return ""
-    return f"+234 {digits[:3]} {digits[3:6]} {digits[6:]}"
+
+    try:
+        parsed = phonenumbers.parse(candidate, "NG")
+    except phonenumbers.NumberParseException:
+        return ""
+    if not phonenumbers.is_valid_number_for_region(parsed, "NG"):
+        return ""
+
+    national = re.sub(
+        r"\D",
+        "",
+        phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.NATIONAL),
+    )
+    if len(national) != 11 or not national.startswith("0"):
+        return ""
+    return f"+234 {national[1:4]} {national[4:7]} {national[7:]}"
 
 
 def _is_placeholder(digits: str) -> bool:
@@ -277,13 +306,37 @@ def _classify_phone(sentence: str, company_tokens: set[str]) -> str:
     return "person"
 
 
+def _company_match(text: str, tokens: set[str]) -> tuple[int, float]:
+    """How much of the company name a hostname or sentence carries."""
+    matched = [token for token in tokens if token in text]
+    total = sum(len(token) for token in tokens)
+    covered = sum(len(token) for token in matched)
+    return len(matched), (covered / total if total else 0.0)
+
+
+def _matches_company(text: str, tokens: set[str]) -> bool:
+    """A domain or sentence belongs to the company only if it carries its name.
+
+    One shared word is not the company: "pukka" alone pulled in
+    pukkayayinlari.com.tr, an Istanbul publisher whose contact page then
+    printed a Turkish phone number as the company's, and "pukka" + "sales"
+    matched a UK stationery firm's Dorset head office. A source must carry at
+    least 60% of the company name's significant letters, which a real address
+    line or the company's own domain almost always does.
+    """
+    if not tokens:
+        return False
+    _count, coverage = _company_match(text, tokens)
+    return coverage >= 0.6
+
+
 def company_domain_from_hits(hits, company: str, answer: str = "") -> str:
     """The company's own domain, matched on the hostname itself.
 
-    Only a hostname containing part of the company name qualifies, and the
-    best match wins rather than the shortest: for "General Gas Nigeria
-    Limited", generalgasng.com (general + gas) must beat niglpgas.com, which
-    is a different business that merely also contains "gas".
+    Only a hostname carrying the company name qualifies, and the best match
+    wins rather than the shortest: for "General Gas Nigeria Limited",
+    generalgasng.com (general + gas) must beat niglpgas.com, which is a
+    different business that merely also contains "gas".
 
     A domain named by the answer is credited too, because the grounded answer
     usually points at the company's real site.
@@ -302,6 +355,8 @@ def company_domain_from_hits(hits, company: str, answer: str = "") -> str:
         host = str(host or "").lower()
         if not host or _platform("https://" + host)[0] or _is_directory(host):
             continue
+        if not _matches_company(host, tokens):
+            continue
         score = sum(len(token) for token in tokens if token in host)
         if not score:
             continue
@@ -313,16 +368,12 @@ def company_domain_from_hits(hits, company: str, answer: str = "") -> str:
 
 
 def _pick_website(answer: str, hits, company: str) -> str:
-    """The company's own domain, else the first real domain the answer names."""
-    matched = company_domain_from_hits(hits, company, answer)
-    if matched:
-        return matched
+    """The company's own domain, or nothing at all.
 
-    for match in DOMAIN_RE.finditer(str(answer or "")):
-        host = match.group(0).lower()
-        if not _is_directory(host):
-            return host
-    return ""
+    A domain that does not carry the company name belongs to some other
+    business, and printing it points the collector at a stranger's office.
+    """
+    return company_domain_from_hits(hits, company, answer)
 
 
 def _clean_address(text: str) -> str:
@@ -338,17 +389,32 @@ def _clean_address(text: str) -> str:
         text,
         flags=re.I,
     )[0]
+    # A contact clause glued to the address is not part of it: the publisher
+    # list prints "... Umuahia Abia State Tel: 07034909274", and that line
+    # belongs to the listing, not to this company.
+    text = re.split(
+        r"[,;]?\s+(?:tel|telephone|phone|mobile|whatsapp|fax|e-?mail|email|website|call)\b\s*[:.]",
+        text,
+        flags=re.I,
+    )[0]
     return text.strip(" ,.;")
 
 
-def _pick_address(tagged: list[tuple[str, str]]) -> str:
-    """An office address, preferring the answer and the company's own site."""
+def _pick_address(tagged: list[tuple[str, str]], company_tokens: set[str]) -> str:
+    """An office address, preferring the answer and the company's own site.
+
+    The sentence must also name the company. Without that check the dossier
+    reported a different business's street address, taken verbatim from a
+    long directory page that merely also mentioned the company.
+    """
     for allowed in (("answer", "site"), ("hit",)):
         for sentence, kind in tagged:
             if kind not in allowed:
                 continue
             low = sentence.lower()
             if _is_negative(sentence):
+                continue
+            if not _matches_company(low, company_tokens):
                 continue
             if not any(hint in low for hint in ADDRESS_HINTS):
                 continue
@@ -440,8 +506,8 @@ def _collect_social_links(
 
         if surname_hit or all_tokens:
             bucket = person
-        elif not linkedin_person and any(
-            token in path or token in title_low for token in company_tokens
+        elif not linkedin_person and _matches_company(
+            f"{path} {title_low}", company_tokens
         ):
             bucket = company
         elif name_in_title:
@@ -486,7 +552,7 @@ def collect(input_ctx, answer: str = "", hits=()) -> dict:
 
     website = _pick_website(answer, hits, company_name)
     company_domain = website
-    address = _pick_address(tagged)
+    address = _pick_address(tagged, company_tokens)
 
     for sentence, _kind in tagged:
         low = sentence.lower()
