@@ -290,10 +290,12 @@ can open. A field no source supports stays empty and the dossier says so.
   company or uses office words (office, desk, enquiries, hotline, branch,
   customer care…), as WhatsApp when the sentence says so, otherwise as the
   subject's. The number already printed in the header is suppressed.
-- **Emails** — freemail addresses (gmail, yahoo, outlook, icloud, proton…) or
-  addresses in a sentence naming the subject go to the subject; addresses on
-  the company domain go to the company. An unrelated domain in a page that
-  merely mentions the company is dropped.
+- **Emails** — an address in a sentence naming the subject goes to the
+  subject. A freemail address (gmail, yahoo, outlook, icloud, proton…) is never
+  enough on its own: it is kept only when its sentence or its page names the
+  subject, so a shop repeating the brand's gmail stays out. Addresses on the
+  company domain go to the company; an unrelated or unowned domain in a page
+  that merely mentions the company is dropped.
 - **Social links** — split into person vs company by handle and by page title,
   with `www.`/non-`www.` forms treated as one link, up to two per platform.
 - **Website** — only a hostname containing part of the company name, and never

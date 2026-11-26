@@ -314,4 +314,6 @@ Worker process only: no port, no webhook, no inbound traffic.
    `access.grant_plan`. A provider can replace the transfer later without
    touching the quota logic.
 3. **Ranking quality** — namesake profiles with a different surname still leak
-   into the top matches, and `extract.collect` can attribute a namesake's email.
+   into the top matches. Emails are safer: a freemail address needs its
+   sentence or page to carry the subject's whole name, and a surname-only
+   social handle is dropped once a full-name link exists.

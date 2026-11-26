@@ -204,6 +204,16 @@ def _sig_tokens(value) -> set[str]:
     return {token for token in tokens if token not in COMPANY_STOPWORDS}
 
 
+def _names_subject(low: str, person_tokens: set[str]) -> bool:
+    """True when the text carries the subject's whole name.
+
+    A freemail address proves nothing about who reads it: an Egyptian shop
+    page repeating a brand name also repeats a gmail inbox, and the surname
+    alone is a dozen namesakes.
+    """
+    return bool(person_tokens) and all(token in low for token in person_tokens)
+
+
 def _bare_host(url: str) -> str:
     host = (urlparse(url).netloc or "").lower().split("@")[-1].split(":")[0]
     return host[4:] if host.startswith("www.") else host
@@ -599,11 +609,22 @@ def collect(input_ctx, answer: str = "", hits=()) -> dict:
     surname = name_parts[-1] if len(name_parts) > 1 else ""
     input_digits = re.sub(r"\D", "", str(ctx.get("phone_e164") or ""))
 
-    tagged: list[tuple[str, str]] = [(sentence, "answer") for sentence in _sentences(answer)]
+    tagged: list[tuple[str, str]] = []
+    # The page a hit came from can name the subject even when the sentence
+    # holding the address does not, so each sentence remembers its page too.
+    page_names_subject: list[bool] = []
+
+    def _tag(sentences, kind: str, page: str = "") -> None:
+        named = _names_subject(page.lower(), person_tokens)
+        for sentence in sentences:
+            tagged.append((sentence, kind))
+            page_names_subject.append(named)
+
+    _tag(_sentences(answer), "answer")
     for hit in hits or ():
         kind = "site" if hit.get("source") == "site" else "hit"
         blob = f"{hit.get('title') or ''}. {hit.get('snippet') or ''}"
-        tagged.extend((sentence, kind) for sentence in _sentences(blob))
+        _tag(_sentences(blob), kind, f"{blob} {hit.get('url') or ''}")
 
     phones: list[str] = []
     whatsapp: list[str] = []
@@ -615,7 +636,7 @@ def collect(input_ctx, answer: str = "", hits=()) -> dict:
     company_domain = website
     address = _pick_address(tagged, company_tokens)
 
-    for sentence, _kind in tagged:
+    for index, (sentence, _kind) in enumerate(tagged):
         low = sentence.lower()
 
         relevant = (
@@ -653,11 +674,18 @@ def collect(input_ctx, answer: str = "", hits=()) -> dict:
             domain = clean.rsplit("@", 1)[-1]
             if company_domain and (domain == company_domain or domain.endswith("." + company_domain)):
                 bucket = company_emails
-            elif domain in FREEMAIL_DOMAINS or any(token in low for token in person_tokens):
+            elif domain in FREEMAIL_DOMAINS:
+                # A freemail inbox is unowned evidence: it reaches Contact
+                # details only when the sentence or its page names the whole
+                # subject, never on the domain or a surname alone.
+                if not (_names_subject(low, person_tokens) or page_names_subject[index]):
+                    continue
+                bucket = person_emails
+            elif any(token in low for token in person_tokens):
                 bucket = person_emails
             else:
-                # An unrelated domain in a page that merely mentions the
-                # company belongs to some other business; never report it.
+                # An unrelated domain, or a freemail inbox nobody ties to the
+                # subject, belongs to some other business; never report it.
                 continue
             if clean not in bucket:
                 bucket.append(clean)
