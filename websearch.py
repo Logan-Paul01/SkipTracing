@@ -111,7 +111,7 @@ def _username_from_url(url: str) -> str:
     return candidate if re.fullmatch(r"[A-Za-z0-9._-]{3,40}", candidate or "") else ""
 
 
-def build_queries(name: str, company: str = "") -> list[str]:
+def build_queries(name: str, company: str = "", city: str = "") -> list[str]:
     """The queries a human skiptracer would actually type.
 
     The debtor's number is deliberately never searched. A phone number is not
@@ -122,6 +122,7 @@ def build_queries(name: str, company: str = "") -> list[str]:
     """
     name = " ".join(str(name or "").split())
     company = " ".join(str(company or "").split())
+    city = " ".join(str(city or "").split())
     queries: list[str] = []
 
     if company:
@@ -131,22 +132,31 @@ def build_queries(name: str, company: str = "") -> list[str]:
         # that the dossier reports under Company details.
         queries.append(f'"{company}" official website address phone email contact')
         queries.append(f'"{company}" facebook OR instagram OR twitter OR linkedin page')
+        if city:
+            # Directory listings (InfoIsInfo, Facebook business cards) are
+            # indexed against the town, not the brand alone.
+            queries.append(f'"{company}" {city} address phone')
     else:
         queries.append(f'"{name}" Nigeria')
 
+    if city:
+        queries.append(f'"{name}" {city}')
     queries.append(f'"{name}" linkedin OR facebook OR instagram profile')
     return queries
 
 
-def answer_prompt(name: str, company: str = "") -> str:
+def answer_prompt(name: str, company: str = "", city: str = "") -> str:
     """Question for the provider's grounded-answer endpoint.
 
     The dossier pulls its structured fields out of this answer, so the prompt
     asks for them by name instead of hoping they show up in a biography.
     """
+    city = " ".join(str(city or "").split())
     subject = f'"{name}"'
     if company:
         subject += f" of {company}"
+    if city:
+        subject += f", based in {city}"
 
     parts = [
         f"Identify {subject}.",
@@ -156,10 +166,11 @@ def answer_prompt(name: str, company: str = "") -> str:
         "and X profiles.",
     ]
     if company:
+        where = f" in {city}" if city else ""
         parts.append(
-            f"Then describe {company}: what the business does, its official website, "
-            "its office address, its phone numbers and email addresses, and its "
-            "social media pages."
+            f"Then describe {company}{where}: what the business does, its official "
+            "website, its office address, its phone numbers and email addresses, "
+            "and its social media pages."
         )
     parts.append(
         "Give phone numbers in full international format and full URLs. If a "
@@ -240,22 +251,30 @@ async def _tavily_search(session, query: str, headers: dict, with_answer: bool =
     return hits, answer
 
 
-async def _run(backend: str, name: str, company: str) -> tuple[list[dict], str]:
+async def _run(
+    backend: str, name: str, company: str, city: str = ""
+) -> tuple[list[dict], str]:
     headers = {"Content-Type": "application/json"}
     if backend == "exa":
         headers["x-api-key"] = config.EXA_API_KEY
     else:
         headers["Authorization"] = f"Bearer {config.TAVILY_API_KEY}"
 
-    queries = build_queries(name, company)
+    queries = build_queries(name, company, city)
 
     async with aiohttp.ClientSession() as session:
         if backend == "exa":
             tasks = [_exa_search(session, query, headers) for query in queries]
-            tasks.append(_exa_answer(session, answer_prompt(name, company), headers))
+            tasks.append(
+                _exa_answer(session, answer_prompt(name, company, city), headers)
+            )
         else:
             tasks = [_tavily_search(session, query, headers) for query in queries]
-            tasks.append(_tavily_search(session, answer_prompt(name, company), headers, with_answer=True))
+            tasks.append(
+                _tavily_search(
+                    session, answer_prompt(name, company, city), headers, with_answer=True
+                )
+            )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -439,7 +458,9 @@ The query is the name and company only: a number is never a useful search
         return []
 
 
-async def search_subject(name: str, company: str = "") -> tuple[list[dict], str]:
+async def search_subject(
+    name: str, company: str = "", city: str = ""
+) -> tuple[list[dict], str]:
     """Search the open web for the subject; return (hits, grounded_answer).
 
     Never raises: a provider failure degrades to an empty result set so the
@@ -452,7 +473,7 @@ async def search_subject(name: str, company: str = "") -> tuple[list[dict], str]
 
     try:
         hits, answer = await asyncio.wait_for(
-            _run(backend, name, company),
+            _run(backend, name, company, city),
             timeout=config.WEB_SEARCH_OVERALL_TIMEOUT,
         )
     except asyncio.TimeoutError:

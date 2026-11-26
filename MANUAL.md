@@ -8,7 +8,7 @@ and `formatter.py` for the dossier layout.
 
 A headless Python Telegram bot (`@AkipTrace_bot`) that builds a public-source
 dossier for a Nigerian loan collector. The collector sends a debtor's full name,
-phone number, gender and optional company; the bot searches the open web (Exa,
+phone number, gender, optional company and optional city/state; the bot searches the open web (Exa,
 or Tavily when its key is set), scores every page deterministically, extracts
 structured contact and company fields, and answers with one HTML dossier. It
 polls with long polling, has no web server, and never contacts the debtor.
@@ -21,7 +21,7 @@ lookups, BVN/NIN data.
 
 | File | Role |
 |---|---|
-| `bot.py` | Telebot handlers, the 4-step conversation, the pipeline call, the hidden `/broadcast`, plain-text fallback when Telegram rejects HTML |
+| `bot.py` | Telebot handlers, the 5-step conversation, the pipeline call, the hidden `/broadcast`, plain-text fallback when Telegram rejects HTML |
 | `config.py` | Every runtime setting and tunable, from env or an optional `.env` |
 | `access.py` | Per-account search allowance, the waitlist and manual-payment offer, `/stats` counters, and the `/broadcast` owner |
 | `db.py` | SQLite: `searches`/`matches` audit log, `users` accounts, `meta` key/value |
@@ -90,7 +90,7 @@ auto-renewing subscription until billing exists.
 
 Flow in `bot.py`:
 
-1. `/trace` calls `access.can_search(uid)` **before** asking for the four
+1. `/trace` calls `access.can_search(uid)` **before** asking for the five
    inputs. No allowance → the account joins the waitlist and gets the paywall,
    and no conversation starts.
 2. `_run_and_reply` calls `access.charge(uid)` **after** the dossier is sent,

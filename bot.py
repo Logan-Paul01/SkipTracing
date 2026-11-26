@@ -61,7 +61,8 @@ WELCOME_TEXT = (
     "1. Debtor's full name\n"
     "2. Phone number\n"
     "3. Gender\n"
-    "4. Company (optional)\n\n"
+    "4. Company (optional)\n"
+    "5. City/state (optional)\n\n"
     f"{access.welcome_line()}\n"
     "/plan shows what is left, /premium how to pay.\n\n"
     "Only public profiles are searched. The number is used to match "
@@ -81,6 +82,7 @@ def _new_state() -> dict:
         "phone": "",
         "gender": "",
         "company": "",
+        "city": "",
         "username": "",
     }
 
@@ -300,7 +302,7 @@ def cmd_cancel(message):
 def cmd_trace(message):
     uid = message.from_user.id
     db.touch_user(uid, getattr(message.from_user, "username", "") or "")
-    # Checked here, before four steps are collected, so a user never fills in a
+    # Checked here, before five steps are collected, so a user never fills in a
     # whole form only to be told they cannot run it.
     if not access.can_search(uid):
         # Reaching the paywall is the demand signal, so it is recorded before
@@ -312,7 +314,7 @@ def cmd_trace(message):
     STATE[uid]["step"] = "name"
     bot.send_message(
         message.chat.id,
-        "Step 1/4 — Send the debtor's <b>full name</b> (first and surname).",
+        "Step 1/5 — Send the debtor's <b>full name</b> (first and surname).",
         parse_mode="HTML",
     )
 
@@ -321,13 +323,23 @@ def cmd_trace(message):
 def cmd_skip(message):
     uid = message.from_user.id
     state = STATE.get(uid)
-    if not state or state.get("step") != "company":
+    if not state or state.get("step") not in ("company", "city"):
         bot.send_message(
             message.chat.id,
-            "/skip is only valid at the company step. Send /trace to start a search.",
+            "/skip is only valid at the company or city/state step. "
+            "Send /trace to start a search.",
         )
         return
-    state["company"] = ""
+    state[state["step"]] = ""
+    if state["step"] == "company":
+        state["step"] = "city"
+        bot.send_message(
+            message.chat.id,
+            "Step 5/5 — Send the debtor's <b>city and state</b> (optional) "
+            "or /skip to continue.",
+            parse_mode="HTML",
+        )
+        return
     state["step"] = "idle"
     _run_and_reply(message, state)
 
@@ -717,7 +729,7 @@ def handle_text(message):
         state["step"] = "phone"
         bot.send_message(
             message.chat.id,
-            "Step 2/4 — Send the debtor's <b>phone number</b> "
+            "Step 2/5 — Send the debtor's <b>phone number</b> "
             "(e.g. 08031234567 or +2348031234567).",
             parse_mode="HTML",
         )
@@ -733,7 +745,7 @@ def handle_text(message):
         state["step"] = "gender"
         bot.send_message(
             message.chat.id,
-            "Step 3/4 — Select the debtor's <b>gender</b>.",
+            "Step 3/5 — Select the debtor's <b>gender</b>.",
             parse_mode="HTML",
             reply_markup=_gender_keyboard(),
         )
@@ -752,7 +764,7 @@ def handle_text(message):
         state["step"] = "company"
         bot.send_message(
             message.chat.id,
-            "Step 4/4 — Send the <b>company</b> (optional) or /skip to continue.",
+            "Step 4/5 — Send the <b>company</b> (optional) or /skip to continue.",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -760,6 +772,17 @@ def handle_text(message):
 
     if step == "company":
         state["company"] = text
+        state["step"] = "city"
+        bot.send_message(
+            message.chat.id,
+            "Step 5/5 — Send the debtor's <b>city and state</b> (optional) "
+            "or /skip to continue.",
+            parse_mode="HTML",
+        )
+        return
+
+    if step == "city":
+        state["city"] = text
         state["step"] = "idle"
         _run_and_reply(message, state)
         return
@@ -788,6 +811,7 @@ async def run_search(uid, user_input) -> dict:
     name = user_input.get("name") or ""
     gender = user_input.get("gender") or ""
     company = user_input.get("company") or ""
+    city = user_input.get("city") or ""
     telegram_username = user_input.get("username") or "unknown"
 
     e164, phone_variants, meta = normalizer.normalize_phone(user_input.get("phone"))
@@ -800,7 +824,7 @@ async def run_search(uid, user_input) -> dict:
     if mode in ("auto", "web") and websearch.provider() is not None:
         # Fast path: a real web search returns pages plus a grounded answer in
         # seconds. Fall through to the curated checks only if it finds nothing.
-        hits, answer = await websearch.search_subject(name, company)
+        hits, answer = await websearch.search_subject(name, company, city)
         web_hits = len(hits)
         profiles_by_url = {
             hit["url"]: {
@@ -834,6 +858,7 @@ async def run_search(uid, user_input) -> dict:
         "name": name,
         "gender": gender,
         "company": company,
+        "city": city,
         "phone_e164": e164,
         "phone_variants": phone_variants,
         "meta": meta,
@@ -899,6 +924,7 @@ def _run_and_reply(message, state) -> None:
         "phone": state.get("phone") or "",
         "gender": state.get("gender") or "",
         "company": state.get("company") or "",
+        "city": state.get("city") or "",
         "username": getattr(message.from_user, "username", "") or "",
     }
 

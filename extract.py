@@ -400,6 +400,55 @@ def _clean_address(text: str) -> str:
     return text.strip(" ,.;")
 
 
+# Directory cards (InfoIsInfo, Medioq, businesslist) print one labelled field
+# per line, and the search snippet of that card is often the only public source
+# for a small firm's street address and landline.
+FIELD_LABEL_RE = re.compile(
+    r"(?:^|[\s#|•·>,;])((?:office\s+|head\s+office\s+|business\s+|postal\s+)?"
+    r"(?:address|telephone|phone|tel|mobile|whatsapp|e-?mail|email))\s*[:.]?\s*",
+    re.I,
+)
+
+
+def _listed_fields(text: str) -> dict[str, str]:
+    """Label → value pairs out of a directory card's labelled lines."""
+    parts = FIELD_LABEL_RE.split(str(text or ""))
+    fields: dict[str, str] = {}
+    for index in range(1, len(parts) - 1, 2):
+        label = " ".join(parts[index].lower().split())
+        value = re.split(r"\s*(?:##|[|•·#]|📍|📞|☎)\s*", parts[index + 1])[0]
+        value = " ".join(value.split()).strip(" ,.;:-–")
+        fields.setdefault(label, value)
+    return fields
+
+
+def _listing_fields(hits, company_tokens: set[str]):
+    """Labelled fields from a card whose own title names the company.
+
+    The company-name check lives on the page title, because the address line
+    itself rarely repeats the business name. A card titled "Pukka Publishing
+    and Sales Company, 26 mission Hill" is that company's listing; a card for
+    another business never matches.
+    """
+    for hit in hits or ():
+        title = str(hit.get("title") or "")
+        if not _matches_company(title.lower(), company_tokens):
+            continue
+        fields = _listed_fields(f"{title}. {hit.get('snippet') or ''}")
+        if fields:
+            yield fields
+
+
+def _clean_listed_address(value: str) -> str:
+    """Tidy a labelled address field, dropping duplicated city words."""
+    text = re.sub(r"\b(\w+)\s+\1\b", r"\1", str(value or ""), flags=re.I)
+    text = _clean_address(text)
+    text = " ".join(text.split()).strip(" ,.;:-–")
+    if len(text) < 8 or not re.search(r"\d", text):
+        return ""
+    return _clip(text, 160)
+
+
 def _pick_address(tagged: list[tuple[str, str]], company_tokens: set[str]) -> str:
     """An office address, preferring the answer and the company's own site.
 
@@ -519,6 +568,18 @@ def _collect_social_links(
         if clean not in urls:
             urls.append(clean)
 
+    # A surname-only match is a namesake: "chima" appears in a dozen unrelated
+    # LinkedIn handles. When any link carries the full name, the surname-only
+    # ones are dropped; without one they stay, so a hyphenated or shortened
+    # handle is still reported.
+    if person_tokens:
+        full = {
+            label: [url for url in urls if all(token in url.lower() for token in person_tokens)]
+            for label, urls in person.items()
+        }
+        if any(full.values()):
+            person = {label: urls for label, urls in full.items() if urls}
+
     return person, company
 
 
@@ -600,6 +661,31 @@ def collect(input_ctx, answer: str = "", hits=()) -> dict:
                 continue
             if clean not in bucket:
                 bucket.append(clean)
+
+    # A directory card is the only source for some small firms' street address
+    # and landline, and its fields are already labelled, so no sentence has to
+    # be guessed at. Only fills what the answer and the site left empty.
+    listed_addresses: list[str] = []
+    for fields in _listing_fields(hits, company_tokens):
+        for label, value in fields.items():
+            if "address" not in label:
+                continue
+            candidate = _clean_listed_address(value)
+            if candidate:
+                listed_addresses.append(candidate)
+        if not company_phones:
+            for label, value in fields.items():
+                if not any(key in label for key in ("telephone", "phone", "tel", "mobile")):
+                    continue
+                for raw in PHONE_RE.findall(value):
+                    number = _norm_phone(raw)
+                    if number and number not in company_phones:
+                        company_phones.append(number)
+
+    # One card prints the street only, another the full line with the road and
+    # state; the most complete address is the useful one.
+    if not address and listed_addresses:
+        address = max(listed_addresses, key=len)
 
     person_socials, company_socials = _collect_social_links(
         answer, hits, person_tokens, company_tokens, surname

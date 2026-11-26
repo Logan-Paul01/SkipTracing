@@ -2,7 +2,8 @@
 
 SkipTrace V1 is a headless Python Telegram bot that builds a public-source
 dossier for a Nigerian loan collector. The collector sends a debtor's full name,
-phone number, gender and (optionally) company; the bot normalizes the number,
+phone number, gender, optional company and optional city/state; the bot
+normalizes the number,
 searches the open web for that person and their employer, pulls structured
 contact and company fields out of the evidence it finds, scores every page
 deterministically, and replies with one HTML dossier. It runs on long polling,
@@ -31,7 +32,7 @@ handful of curated public-profile checks.
 
 | Module | Responsibility |
 |---|---|
-| `bot.py` | Telebot handlers, 4-step conversation, pipeline orchestration, plain-text fallback when Telegram rejects the HTML |
+| `bot.py` | Telebot handlers, 5-step conversation, pipeline orchestration, plain-text fallback when Telegram rejects the HTML |
 | `config.py` | All runtime settings, read from environment variables only |
 | `normalizer.py` | Nigerian phone parsing; returns E.164, digit variants and carrier/region metadata |
 | `names.py` | Orthographic rules plus soundex/metaphone/nysiis to derive candidate handles |
@@ -105,7 +106,7 @@ Every account gets **10 free searches**. After that, **SkipTrace Premium** is
 `PLAN_PRICE_NGN`, `PLAN_SEARCHES` and `PLAN_DAYS` change those numbers without
 a code change.
 
-- The allowance is checked when `/trace` starts, so nobody fills in four steps
+- The allowance is checked when `/trace` starts, so nobody fills in five steps
   for a search they cannot run.
 - A search is charged only after its dossier has been delivered: a failed
   search costs nothing.
@@ -203,6 +204,8 @@ collector reads.
 - with a company: `"name" "company"`, `"name" company Nigeria`, a
   `"company" official website address phone email contact` query and a
   `"company" facebook OR instagram OR twitter OR linkedin page` query
+- with a city/state: those same queries anchored to the town (a directory
+  listing such as InfoIsInfo is indexed by town, not brand), plus `"name" city`
 - without one: `"name" Nigeria`
 - always: `"name" linkedin OR facebook OR instagram profile`
 
@@ -297,7 +300,10 @@ can open. A field no source supports stays empty and the dossier says so.
   a directory or social/professional-network host.
 - **Address** — a sentence from the answer or the company site containing a
   street/estate/plot hint, a digit, a comma or a state, with the lead-in and any
-  glued-on "and its phone…" clause stripped.
+  glued-on "and its phone…" clause stripped. When a page's own title names the
+  company, the labelled `Address:` field of a directory card (InfoIsInfo,
+  Medioq, businesslist) and its `Telephone:` line are used too: for a small
+  firm those cards are often the only public source of an office address.
 - **About** — one sentence that mentions the company, does not mention the
   subject, and reads like a description ("is a", "provides", "supplies",
   "distributes"…).
@@ -315,8 +321,8 @@ Create the bot with [@BotFather](https://t.me/BotFather). Then open a chat with
 it, send `/start`, and send `/trace` to run a search:
 
 - `/start` — welcome text and the free-search allowance
-- `/trace` — start a trace (name → phone → gender → company)
-- `/skip` — accept an empty company at step 4
+- `/trace` — start a trace (name → phone → gender → company → city/state)
+- `/skip` — accept an empty company or city/state
 - `/plan` — remaining searches and which plan the account is on
 - `/cancel` — reset the conversation (also stops a `/broadcast` draft)
 - `/premium` — the ₦200 offer, the account to pay, and a waitlist place
