@@ -512,6 +512,7 @@ REVENUE_COLUMNS = (
     "free_searches_used",
     "dossiers",
     "payment",
+    "bank_vote",
 )
 
 
@@ -541,11 +542,15 @@ def revenue_rows() -> list[dict]:
                     WHEN w.resolved_at IS NOT NULL THEN 'confirmed'
                     WHEN w.claimed_paid_at IS NOT NULL THEN 'claimed'
                     ELSE 'waitlist'
-                END AS payment
+                END AS payment,
+                COALESCE(v.vote, '') AS bank_vote
             FROM users u
             LEFT JOIN waitlist w ON w.telegram_id = u.telegram_id
+            LEFT JOIN feature_votes v
+                ON v.telegram_id = u.telegram_id AND v.feature = ?
             ORDER BY u.first_seen ASC
-            """
+            """,
+            (FEATURE_ASSOCIATED_BANK,),
         ).fetchall()
     return [dict(row) for row in rows]
 

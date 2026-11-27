@@ -334,8 +334,9 @@ Owner-only and hidden like `/stats`. It writes a consistent copy of the live
 database and a revenue CSV, sends both to the operator in Telegram, then deletes
 its temporary files — the panel's 1 GB disk does not keep a second copy. The CSV
 has one row per account: id, username, first/last seen, plan, expiry, purchases,
-paid searches left, free searches used, dossiers run and payment state
-(`waitlist` / `claimed` / `confirmed`). Neither file contains anything about a
+paid searches left, free searches used, dossiers run, payment state
+(`waitlist` / `claimed` / `confirmed`) and the associated-bank answer
+(`bank_vote`: `yes`, `no` or empty). Neither file contains anything about a
 traced person.
 
 ## Gotchas
