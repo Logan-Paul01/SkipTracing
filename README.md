@@ -72,7 +72,9 @@ Sources scanned    N public pages (or variations tested in fallback mode)
 
 🏢 Company details
    Company, About (one sentence), Website, Address, Phone(s), Email(s), socials
-   "No company supplied and none named in the sources." when there is none
+   "No company supplied and none named in the sources." when there is none,
+   and "No public address, phone or page found for this company." when the
+   name is entered but no source carries the whole name
 
 🏅 N matching profiles — open them with the button below
 
@@ -305,14 +307,21 @@ can open. A field no source supports stays empty and the dossier says so.
   that merely mentions the company is dropped.
 - **Social links** — split into person vs company by handle and by page title,
   with `www.`/non-`www.` forms treated as one link, up to two per platform.
-- **Website** — only a hostname containing part of the company name, and never
-  a directory or social/professional-network host.
+- **Website** — only a hostname carrying every significant word of the company
+  name, and never a directory or social/professional-network host.
 - **Address** — a sentence from the answer or the company site containing a
   street/estate/plot hint, a digit, a comma or a state, with the lead-in and any
   glued-on "and its phone…" clause stripped. When a page's own title names the
-  company, the labelled `Address:` field of a directory card (InfoIsInfo,
+  whole company, the labelled `Address:` field of a directory card (InfoIsInfo,
   Medioq, businesslist) and its `Telephone:` line are used too: for a small
   firm those cards are often the only public source of an office address.
+- **Company-name matching** — every significant word of the entered name must
+  appear (a plural/singular swap on a long word is allowed). A partial match is
+  rejected: "Jacobs Memoria Farms" of Owerri must not pick up "Grace Jacobs
+  Farms Limited" of Benin City, which used to supply a stranger's street
+  address, three phone lines and a US LinkedIn page. A search engine's own
+  results page is skipped as a listing, because its title is the query echoed
+  back and so carries the company name by construction.
 - **About** — one sentence that mentions the company, does not mention the
   subject, and reads like a description ("is a", "provides", "supplies",
   "distributes"…).

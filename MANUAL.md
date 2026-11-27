@@ -356,6 +356,12 @@ traced person.
 - The audit log must never raise into the pipeline: writes are wrapped.
 - Namesake noise: profiles of a different surname can still score ~40 because
   of shared first names and company mentions. Known, not fixed.
+- Company fields need the whole name: every significant word of the entered
+  company must appear in the source, so "Jacobs Memoria Farms" (Owerri) no
+  longer takes the street address, phone lines and LinkedIn page of "Grace
+  Jacobs Farms Limited" (Benin City). A business whose sources only ever print a
+  shortened name now shows the empty-block line instead of another firm's
+  details.
 
 ## Open decisions
 

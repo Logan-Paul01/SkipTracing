@@ -319,6 +319,11 @@ def _company_block(company: dict) -> list[str]:
     if social_lines:
         lines.extend(social_lines)
 
+    # A name and nothing else is an honest empty block: the entered company
+    # had no public address, line or page that could be tied to it.
+    if len(lines) == 2:
+        lines.append("No public address, phone or page found for this company.")
+
     lines.append("")
     return lines
 

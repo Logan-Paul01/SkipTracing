@@ -176,6 +176,14 @@ NEGATIVE_PHRASES = (
     "were not",
     "was not",
     "unknown",
+    # An answer that reports other businesses by name has not described this
+    # one, however much its wording looks like a description.
+    "none of",
+    "no mention",
+    "not mention",
+    "no information",
+    "not provided",
+    "not included",
 )
 
 
@@ -307,7 +315,7 @@ def _company_name_from_answer(answer: str) -> str:
 
 def _classify_phone(sentence: str, company_tokens: set[str]) -> str:
     low = sentence.lower()
-    if any(token in low for token in company_tokens):
+    if _matches_company(low, company_tokens):
         return "company"
     if any(word in low for word in OFFICE_WORDS):
         return "company"
@@ -316,12 +324,11 @@ def _classify_phone(sentence: str, company_tokens: set[str]) -> str:
     return "person"
 
 
-def _company_match(text: str, tokens: set[str]) -> tuple[int, float]:
-    """How much of the company name a hostname or sentence carries."""
-    matched = [token for token in tokens if token in text]
-    total = sum(len(token) for token in tokens)
-    covered = sum(len(token) for token in matched)
-    return len(matched), (covered / total if total else 0.0)
+def _token_present(token: str, text: str) -> bool:
+    """True when the text carries the token, allowing a plural/singular swap."""
+    if token in text:
+        return True
+    return len(token) >= 5 and token.endswith("s") and token[:-1] in text
 
 
 def _matches_company(text: str, tokens: set[str]) -> bool:
@@ -330,14 +337,18 @@ def _matches_company(text: str, tokens: set[str]) -> bool:
     One shared word is not the company: "pukka" alone pulled in
     pukkayayinlari.com.tr, an Istanbul publisher whose contact page then
     printed a Turkish phone number as the company's, and "pukka" + "sales"
-    matched a UK stationery firm's Dorset head office. A source must carry at
-    least 60% of the company name's significant letters, which a real address
-    line or the company's own domain almost always does.
+    matched a UK stationery firm's Dorset head office.
+
+    Every significant word has to be there. A two-thirds score was not enough:
+    "Jacobs Memoria Farms" of Owerri matched "Grace Jacobs Farms Limited" of
+    Benin City, whose directory card then supplied a stranger's office address,
+    three phone lines and a US LinkedIn page. The distinctive word ("Memoria")
+    is the whole difference between two businesses, so a partial name match is
+    no match at all.
     """
     if not tokens:
         return False
-    _count, coverage = _company_match(text, tokens)
-    return coverage >= 0.6
+    return all(_token_present(token, text) for token in tokens)
 
 
 def company_domain_from_hits(hits, company: str, answer: str = "") -> str:
@@ -367,7 +378,7 @@ def company_domain_from_hits(hits, company: str, answer: str = "") -> str:
             continue
         if not _matches_company(host, tokens):
             continue
-        score = sum(len(token) for token in tokens if token in host)
+        score = sum(len(token) for token in tokens if _token_present(token, host))
         if not score:
             continue
         if host in answer_low:
@@ -420,16 +431,28 @@ FIELD_LABEL_RE = re.compile(
 )
 
 
-def _listed_fields(text: str) -> dict[str, str]:
-    """Label → value pairs out of a directory card's labelled lines."""
+def _listed_fields(text: str) -> dict[str, list[str]]:
+    """Label → values out of a directory card's labelled lines.
+
+    A card's heading often carries the label with nothing after it ("... -
+    address, contacts, owners") and the usable value arrives on a later line,
+    so every value is kept and the caller takes the first one that is real.
+    """
     parts = FIELD_LABEL_RE.split(str(text or ""))
-    fields: dict[str, str] = {}
+    fields: dict[str, list[str]] = {}
     for index in range(1, len(parts) - 1, 2):
         label = " ".join(parts[index].lower().split())
         value = re.split(r"\s*(?:##|[|•·#]|📍|📞|☎)\s*", parts[index + 1])[0]
         value = " ".join(value.split()).strip(" ,.;:-–")
-        fields.setdefault(label, value)
+        if value:
+            fields.setdefault(label, []).append(value)
     return fields
+
+
+# A search engine's own result page is not a listing: its title is the query
+# echoed back ("Jacobs Memoria Farms Imo Owerri address phone"), so it carries
+# the company name by construction and its "fields" are other businesses.
+QUERY_ECHO_HOSTS = {"exa.ai", "google.com", "bing.com", "duckduckgo.com"}
 
 
 def _listing_fields(hits, company_tokens: set[str]):
@@ -441,6 +464,8 @@ def _listing_fields(hits, company_tokens: set[str]):
     another business never matches.
     """
     for hit in hits or ():
+        if _bare_host(hit.get("url") or "") in QUERY_ECHO_HOSTS:
+            continue
         title = str(hit.get("title") or "")
         if not _matches_company(title.lower(), company_tokens):
             continue
@@ -452,6 +477,12 @@ def _listing_fields(hits, company_tokens: set[str]):
 def _clean_listed_address(value: str) -> str:
     """Tidy a labelled address field, dropping duplicated city words."""
     text = re.sub(r"\b(\w+)\s+\1\b", r"\1", str(value or ""), flags=re.I)
+    # The label can be followed by the next field's label instead of a value.
+    if re.match(
+        r"(?i)^(?:phone|telephone|tel|mobile|whatsapp|e-?mail|contact|fax|website)\b",
+        text,
+    ):
+        return ""
     text = _clean_address(text)
     text = " ".join(text.split()).strip(" ,.;:-–")
     if len(text) < 8 or not re.search(r"\d", text):
@@ -502,7 +533,7 @@ def _pick_about(
             continue
         if address and sentence in address:
             continue
-        if not any(token in low for token in company_tokens):
+        if not _matches_company(low, company_tokens):
             continue
         if any(token in low for token in person_tokens):
             continue
@@ -647,7 +678,17 @@ def collect(input_ctx, answer: str = "", hits=()) -> dict:
             or any(word in low for word in PERSON_WORDS)
         )
 
-        if relevant:
+        # A sentence that carries one word of the company name but not the
+        # name itself belongs to some other business ("Grace Jacobs Farms
+        # Limited" for "Jacobs Memoria Farms"); its numbers are nobody's here.
+        names_person = any(token in low for token in person_tokens)
+        other_business = (
+            any(token in low for token in company_tokens)
+            and not _matches_company(low, company_tokens)
+            and not names_person
+        )
+
+        if relevant and not other_business:
             is_whatsapp = "whatsapp" in low
             for raw in PHONE_RE.findall(sentence):
                 digits = re.sub(r"\D", "", raw)
@@ -695,20 +736,22 @@ def collect(input_ctx, answer: str = "", hits=()) -> dict:
     # be guessed at. Only fills what the answer and the site left empty.
     listed_addresses: list[str] = []
     for fields in _listing_fields(hits, company_tokens):
-        for label, value in fields.items():
+        for label, values in fields.items():
             if "address" not in label:
                 continue
-            candidate = _clean_listed_address(value)
-            if candidate:
-                listed_addresses.append(candidate)
+            for value in values:
+                candidate = _clean_listed_address(value)
+                if candidate:
+                    listed_addresses.append(candidate)
         if not company_phones:
-            for label, value in fields.items():
+            for label, values in fields.items():
                 if not any(key in label for key in ("telephone", "phone", "tel", "mobile")):
                     continue
-                for raw in PHONE_RE.findall(value):
-                    number = _norm_phone(raw)
-                    if number and number not in company_phones:
-                        company_phones.append(number)
+                for value in values:
+                    for raw in PHONE_RE.findall(value):
+                        number = _norm_phone(raw)
+                        if number and number not in company_phones:
+                            company_phones.append(number)
 
     # One card prints the street only, another the full line with the road and
     # state; the most complete address is the useful one.
