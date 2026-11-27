@@ -11,9 +11,13 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import re
 import secrets
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 
 import telebot
@@ -26,7 +30,6 @@ from telebot.types import (
 )
 
 import access
-import banks
 import config
 import db
 import extract
@@ -73,6 +76,47 @@ WELCOME_TEXT = (
 
 TEXT_LIMIT = 4000
 UNKNOWN_COMMAND = "Unknown command. Send /trace to start a search or /cancel to stop."
+
+# The guide is reached from /guide and from the button under a trace that came
+# back empty. It teaches the form, not "try again": a second attempt on the
+# same details is exactly what makes a thin result feel like a dead end.
+GUIDE_TEXT = (
+    "📖 <b>How to get the most out of SkipTrace</b>\n\n"
+    "The bot reads public pages. The closer the details you send are to the "
+    "way the debtor appears on those pages, the better the chance a real "
+    "profile comes back.\n\n"
+    "<b>Details that help</b>\n"
+    "• The full name as he uses it — first name and surname, spelled the way "
+    "he writes it.\n"
+    "• The company or business name when you know it. A business page often "
+    "carries a phone, address and email that a personal profile never shows.\n"
+    "• The city and state where he lives or works. Many people share a name; a "
+    "place is what separates them.\n"
+    "• A married name, a surname-first version, or a common short form, if you "
+    "know he uses one.\n\n"
+    "<b>What the bot cannot do</b>\n"
+    "• It cannot look a phone number up. The number is only used to confirm a "
+    "profile that already shows it.\n"
+    "• It cannot see private accounts, bank records, or anything behind a "
+    "login.\n"
+    "• A thin result usually means the person keeps little public presence — "
+    "not that the details were wrong.\n\n"
+    "<b>Reading a dossier</b>\n"
+    "• Every line is a lead to check, not proof of identity.\n"
+    "• Open the source link before you act on a phone, email or address.\n"
+    "• A trace that finds nothing is never charged.\n\n"
+    "/guide opens this any time."
+)
+
+
+def _guide_markup() -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(
+            "📖 How to get better results", callback_data="gd:open"
+        )
+    )
+    return markup
 
 
 def _new_state() -> dict:
@@ -144,7 +188,7 @@ def _view_markup(token: str) -> InlineKeyboardMarkup:
         )
     )
     markup.add(
-        InlineKeyboardButton("🏦 Associated banks", callback_data=f"pv:{token}:bank")
+        InlineKeyboardButton("🏦 Associated bank", callback_data=f"pv:{token}:bank")
     )
     return markup
 
@@ -164,53 +208,49 @@ def _profiles_limit(structured: dict) -> int:
     return formatter.MAX_MATCHES
 
 
-def _evidence_texts(hits, answer: str = "") -> list[tuple[str, str]]:
-    """The prose a viewer can scan, as (text, url) pairs."""
-    texts: list[tuple[str, str]] = [(answer or "", "")]
-    for hit in hits or ():
-        texts.append(
-            (
-                f"{hit.get('title') or ''}. {hit.get('snippet') or ''}",
-                hit.get("url") or "",
-            )
-        )
-    return texts
+# One question per feature, stored in ``feature_votes`` so the answers can be
+# counted in /stats and the revenue export.
+BANK_FEATURE = db.FEATURE_ASSOCIATED_BANK
+
+# Deliberately neutral: it describes the feature and says why it is not built,
+# without promising a recovery outcome or nudging either answer.
+BANK_INTEREST_TEXT = (
+    "🏦 <b>Associated bank</b>\n"
+    "<i>A feature that has not been built yet.</i>\n\n"
+    "<b>What it would do</b>\n"
+    "After you send the debtor's phone number, the bot would show the bank "
+    "the account behind that number is held with.\n\n"
+    "<b>Why it is not available</b>\n"
+    "A phone number on its own does not say which bank an account is with, so "
+    "the bot would need a data source it does not have today.\n\n"
+    "<b>Would you use it if it existed?</b>\n"
+    "Either answer is useful — it only decides what gets built next."
+)
+
+BANK_VOTED_TEXT = {
+    "yes": (
+        "✅ <b>Recorded: you would use it.</b>\n\n"
+        "Thanks — that goes into the count of how many collectors want an "
+        "associated-bank lookup."
+    ),
+    "no": (
+        "🙅 <b>Recorded: you would not use it.</b>\n\n"
+        "Thanks — that is just as useful to know."
+    ),
+}
 
 
-def _bank_view(view: dict) -> str:
-    """The Associated banks tab, built once and then cached on the view."""
-    if view.get("banks"):
-        return view["banks"]
-
-    payload = view.get("payload") or {}
-    phone = payload.get("phone") or ""
-    name = payload.get("name") or ""
-    company = payload.get("company") or ""
-
-    accounts = banks.find_accounts(
-        _evidence_texts(payload.get("hits"), payload.get("answer") or ""),
-        ignore_digits=phone,
+def _bank_interest_markup(token: str) -> InlineKeyboardMarkup:
+    """Yes/no under the feature description, with a way back to the dossier."""
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("✅ Yes, I would use it", callback_data=f"fb:{token}:yes"),
+        InlineKeyboardButton("🙅 No, I would not", callback_data=f"fb:{token}:no"),
     )
-
-    # One targeted search, on demand only: the pages a trace already returned
-    # sometimes name the bank but not the account, and a marketplace listing
-    # or business page is where a published account number actually lives.
-    searched = websearch.provider() is not None
-    if searched:
-        try:
-            extra_hits = asyncio.run(websearch.search_account_details(name, company))
-        except Exception:  # noqa: BLE001 - an optional tab must never crash
-            logger.warning("Account-detail search failed", exc_info=True)
-            extra_hits = []
-        accounts = banks.merge(
-            accounts,
-            banks.find_accounts(_evidence_texts(extra_hits), ignore_digits=phone),
-        )
-
-    view["banks"] = banks.format_view(
-        accounts, subject=name, company=company, searched=searched
+    markup.add(
+        InlineKeyboardButton("⬅️ Back to dossier", callback_data=f"pv:{token}:back")
     )
-    return view["banks"]
+    return markup
 
 
 @bot.callback_query_handler(
@@ -238,11 +278,9 @@ def handle_dossier_view(call):
     if action == "prof":
         text, markup = view["profiles"], _back_markup(token)
     elif action == "bank":
-        bot.answer_callback_query(
-            call.id, "Looking up published account details…"
-        )
-        answered = True
-        text, markup = _bank_view(view), _back_markup(token)
+        # No lookup runs here: the feature this button stands for cannot be
+        # built from a phone number, so the tab asks whether it is wanted.
+        text, markup = BANK_INTEREST_TEXT, _bank_interest_markup(token)
     else:
         text, markup = view["main"], _view_markup(token)
 
@@ -278,6 +316,77 @@ def _send_html(chat_id: int, text: str, reply_markup=None):
         return bot.send_message(
             chat_id, _strip_html(text), reply_markup=reply_markup
         )
+
+
+@bot.callback_query_handler(
+    func=lambda call: (call.data or "").split(":", 1)[0] == "gd"
+)
+def handle_guide_button(call):
+    """Open the guide from the button under an empty trace."""
+    bot.answer_callback_query(call.id)
+    try:
+        bot.send_message(
+            call.message.chat.id, GUIDE_TEXT, parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except ApiTelegramException:
+        bot.send_message(call.message.chat.id, _strip_html(GUIDE_TEXT))
+
+
+@bot.callback_query_handler(
+    func=lambda call: (call.data or "").split(":", 1)[0] == "fb"
+)
+def handle_feature_vote(call):
+    """Record a yes/no answer to a feature question.
+
+    The vote belongs to the account that ran the trace, and answering again
+    replaces the earlier answer, so a change of mind is not counted twice.
+    """
+    parts = (call.data or "").split(":", 2)
+    if len(parts) != 3 or parts[2] not in BANK_VOTED_TEXT:
+        bot.answer_callback_query(call.id)
+        return
+
+    _prefix, token, vote = parts
+    view = VIEWS.get(token)
+    if view and int(call.from_user.id) != int(view.get("uid") or 0):
+        bot.answer_callback_query(call.id, "This dossier belongs to another account.")
+        return
+
+    uid = int(call.from_user.id)
+    try:
+        db.record_vote(uid, BANK_FEATURE, vote)
+    except Exception:  # noqa: BLE001 - a poll must never break the chat
+        logger.warning("Feature vote write failed for telegram_id=%s", uid, exc_info=True)
+
+    if view:
+        # The view stays valid, so the collector can still go back to it.
+        try:
+            bot.edit_message_text(
+                _truncate(BANK_VOTED_TEXT[vote]),
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=_back_markup(token),
+                disable_web_page_preview=True,
+            )
+        except ApiTelegramException as exc:
+            if "not modified" not in str(exc).lower():
+                logger.warning("Could not show the vote confirmation: %s", exc)
+    bot.answer_callback_query(call.id, "Recorded")
+    logger.info("Feature vote %s=%s by telegram_id=%s", BANK_FEATURE, vote, uid)
+
+
+@bot.message_handler(commands=["guide"])
+def cmd_guide(message):
+    """The usage guide, available to anyone at any time."""
+    _reset(message.from_user.id)
+    bot.send_message(
+        message.chat.id,
+        GUIDE_TEXT,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 @bot.message_handler(commands=["start"])
@@ -866,22 +975,21 @@ async def run_search(uid, user_input) -> dict:
 
     matches = scorer.rank_hits(hits, profiles_by_url, input_ctx)
 
+    structured = extract.collect(input_ctx, answer, hits)
+    findings = formatter.findings(structured, matches)
+
+    # Counters only: the row records that a trace ran and how it went. The
+    # name, phone, company and the profiles themselves are not stored.
     try:
-        search_id = db.log_search(
+        db.log_search(
             telegram_id=uid,
             telegram_username=telegram_username,
-            full_name=name,
-            phone=e164,
-            gender=gender,
-            company=company,
             variations_count=len(usernames),
             matches_count=len(matches),
+            found=bool(findings.get("anything")),
         )
-        db.log_matches(search_id, matches)
-    except Exception:  # noqa: BLE001 - audit log must never break a search
-        logger.warning("Audit log write failed", exc_info=True)
-
-    structured = extract.collect(input_ctx, answer, hits)
+    except Exception:  # noqa: BLE001 - a counter must never break a search
+        logger.warning("Search counter write failed", exc_info=True)
     dossier = formatter.format_dossier(
         input_ctx,
         matches,
@@ -897,7 +1005,7 @@ async def run_search(uid, user_input) -> dict:
         "profiles": formatter.format_profiles(
             matches, _profiles_limit(structured)
         ),
-        "findings": formatter.findings(structured, matches),
+        "findings": findings,
         "matches": matches,
         "hits": hits,
         "answer": answer,
@@ -955,14 +1063,6 @@ def _run_and_reply(message, state) -> None:
             "message_id": None,
             "main": result["dossier"],
             "profiles": result["profiles"],
-            "banks": "",
-            "payload": {
-                "name": payload["name"],
-                "company": payload["company"],
-                "phone": payload["phone"],
-                "hits": result["hits"],
-                "answer": result["answer"],
-            },
         }
     )
     sent = _send_html(
@@ -975,7 +1075,12 @@ def _run_and_reply(message, state) -> None:
     # with something usable: "nothing found" is not worth a search while the
     # bot is still earning its first users.
     if not result["findings"]["anything"]:
-        bot.send_message(chat_id, _nothing_found_text(uid), parse_mode="HTML")
+        bot.send_message(
+            chat_id,
+            _nothing_found_text(uid),
+            parse_mode="HTML",
+            reply_markup=_guide_markup(),
+        )
         logger.info("No findings for telegram_id=%s; not charged", uid)
         return
 
@@ -986,6 +1091,73 @@ def _run_and_reply(message, state) -> None:
             bot.send_message(chat_id, note)
     except Exception:  # noqa: BLE001 - billing must never break a trace
         logger.warning("Search allowance update failed", exc_info=True)
+
+
+@bot.message_handler(commands=["backup"])
+def cmd_backup(message):
+    """Owner-only: send the database and a revenue CSV to the operator.
+
+    The panel host has no external disk, so a copy that leaves the server is
+    the only backup that survives it. Both files are sent to Telegram and the
+    temporary copies are deleted afterwards; neither contains debtor details.
+    """
+    uid = message.from_user.id
+    if not access.is_owner(uid):
+        bot.send_message(message.chat.id, UNKNOWN_COMMAND)
+        return
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    folder = tempfile.mkdtemp(prefix="skiptrace-backup-")
+    database_copy = os.path.join(folder, f"skiptrace-{stamp}.db")
+    revenue_csv = os.path.join(folder, f"revenue-{stamp}.csv")
+    try:
+        db.backup_to(database_copy)
+        accounts = db.export_revenue_csv(revenue_csv)
+    except Exception:  # noqa: BLE001 - report it instead of failing silently
+        logger.exception("Backup could not be written")
+        shutil.rmtree(folder, ignore_errors=True)
+        bot.send_message(message.chat.id, "⚠️ The backup could not be written.")
+        return
+
+    bot.send_message(
+        message.chat.id,
+        f"🗄 <b>Backup ready</b>\n{accounts} account(s) in the revenue export.",
+        parse_mode="HTML",
+    )
+    for path, caption in (
+        (database_copy, "Full database copy"),
+        (revenue_csv, f"Revenue export — {accounts} accounts"),
+    ):
+        try:
+            with open(path, "rb") as handle:
+                bot.send_document(message.chat.id, handle, caption=caption)
+        except Exception:  # noqa: BLE001 - one failed file must not lose the other
+            logger.exception("Could not send backup file %s", path)
+            bot.send_message(
+                message.chat.id,
+                f"⚠️ Could not send {os.path.basename(path)}.",
+            )
+    shutil.rmtree(folder, ignore_errors=True)
+    logger.info("Backup sent to operator %s (%s accounts)", uid, accounts)
+
+
+def _build_id() -> str:
+    """The commit the running code came from, so the console proves the pull.
+
+    A panel host keeps the process alive across a GitHub update, so the only
+    reliable way to know which code is live is to print its commit at start.
+    """
+    try:
+        finished = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return finished.stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001 - the marker is informational only
+        return "unknown"
 
 
 def main() -> None:
@@ -1021,6 +1193,7 @@ def main() -> None:
 
     logger.info("Authenticated as @%s", getattr(me, "username", "unknown"))
     logger.info("SkipTrace V1 starting (audit log: %s)", config.DB_PATH)
+    logger.info("Build %s", _build_id())
     logger.info("Long polling started")
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=30)

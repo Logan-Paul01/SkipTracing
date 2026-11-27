@@ -27,7 +27,7 @@ handful of curated public-profile checks.
   → extract.collect                 phones, WhatsApp, emails, socials,
                                     website, address, company summary
   → formatter.format_dossier        Telegram-safe HTML
-  → db.log_search / log_matches     SQLite audit trail
+  → db.log_search                  SQLite usage counters (no debtor data)
 ```
 
 | Module | Responsibility |
@@ -41,9 +41,9 @@ handful of curated public-profile checks.
 | `extract.py` | Structured person/company fields pulled from the answer, the pages and the company site |
 | `scorer.py` | Auditable per-page confidence score and the report threshold |
 | `formatter.py` | Dossier layout, the profiles view, clipping and length trimming |
-| `banks.py` | Published bank-account details for the "Associated banks" view |
+| `banks.py` | Parked reader for published bank-account details; no longer wired to a button |
 | `access.py` | Free-search allowance, waitlist and manual-payment offer, usage stats, `/broadcast` owner |
-| `db.py` | SQLite audit log (`searches`, `matches`), accounts (`users`), `meta` |
+| `db.py` | SQLite usage counters (`searches`), accounts (`users`), `feature_votes`, `meta`, revenue export and backup |
 
 ## Dossier layout
 
@@ -86,10 +86,13 @@ screenshots of the same trace:
 - **🏅 Top matching profiles** — 🥇 Site — score/100, display name, quoted
   snippet, URL and reasons. Three cards when the dossier already carries
   structured contact or company data, eight when the evidence is thin.
-- **🏦 Associated banks** — bank accounts this person or company published on a
-  public page (`Account number: 2045678931 GTBank`), with the source link. The
-  tab is built on demand: it scans the pages the trace already returned and
-  then runs one extra targeted search.
+- **🏦 Associated bank** — a feature question, not a lookup. It explains in
+  plain words what an associated-bank lookup would do (the bank behind the
+  phone number from step 2), says why it is not available yet, and offers
+  **✅ Yes, I would use it** / **🙅 No, I would not**. The answer is stored in
+  `feature_votes`, one row per account, and a second answer replaces the first,
+  so the count never double-counts. The wording stays neutral on purpose: it
+  asks, it does not sell.
 - **⬅️ Back to dossier** — returns to the main view with both buttons again.
 
 A view only opens for the account that ran the trace; anyone else is told the
@@ -133,8 +136,12 @@ a code change.
 - **Demand is tracked.** `/paid` flags the first payment claim per account, and
   the hidden owner command `/stats` reports accounts, collectors who ran a
   trace, dossiers delivered, waitlist size, payment claims, paid accounts
-  (lifetime) and the paid conversion rate. The launch rule: 30% of accounts
-  paying ₦200 before the price moves and a bigger feature is added.
+  (lifetime) and the paid conversion rate; it also reports dossiers with a
+  record vs nothing found and the associated-bank poll (yes/no). The launch
+  rule: 30% of accounts paying ₦200 before the price moves and a bigger feature
+  is added. `/backup` (owner-only, hidden) sends a database copy and a revenue
+  CSV to the operator's chat and deletes its temporary files, so the ledger is
+  recoverable without SFTP.
 - **A claim is never lost.** A payment filed before the operator has claimed
   ownership stays pending and is delivered the moment `/broadcast` is claimed;
   `/stats` lists anything still waiting with its sender name and ID.
@@ -324,14 +331,16 @@ it, send `/start`, and send `/trace` to run a search:
 
 - `/start` — welcome text and the free-search allowance
 - `/trace` — start a trace (name → phone → gender → company → city/state)
+- `/guide` — how to fill the form so a real profile is more likely to come back
+  (also reachable from the button under a trace that found nothing)
 - `/skip` — accept an empty company or city/state
 - `/plan` — remaining searches and which plan the account is on
 - `/cancel` — reset the conversation (also stops a `/broadcast` draft)
 - `/premium` — the ₦200 offer, the account to pay, and a waitlist place
 - `/paid` — the collector has transferred; asks for the sender name and sends the claim to the operator
 
-`/broadcast` and `/stats` exist but are deliberately undocumented in the bot:
-see [Operator broadcast](#operator-broadcast).
+`/broadcast`, `/stats` and `/backup` exist but are deliberately undocumented in
+the bot: see [Operator broadcast](#operator-broadcast).
 
 A `.env` file is read automatically if it sits next to `bot.py` (git-ignored,
 loaded at import, never overriding a variable that is already exported):
@@ -399,7 +408,8 @@ webhook and no inbound traffic.
 2. **GitHub Integration** → repository URL, branch `main` → **Clone**. Wispbyte
    has no push webhook: after a commit, press **Pull**, then restart the server.
 3. **Startup** → command: `bash start.sh`. The script installs the pinned
-   requirements into the server's Python and then runs `python -u bot.py`, so a
+   requirements into the server's Python — skipped when `requirements.txt` is
+   unchanged since the last install — and then runs `python -u bot.py`, so a
    server that lost its packages still starts. (`pip install -r
    requirements.txt && python bot.py` also works.)
 4. **Startup → Server Configuration** → add `BOT_TOKEN`, `EXA_API_KEY` (or
@@ -413,6 +423,22 @@ Free servers have no SFTP, and a pull only takes effect on the next restart.
 Never run two pollers on one token: stop any other instance first. `.env`,
 `skiptrace.db`, `bot.log`, `custom_venv/` and `__pycache__/` are git-ignored, so
 the clone the panel pulls never carries a secret or a stale audit log.
+
+**A restart alone does not update the code.** Restarting re-runs `start.sh`
+against the files already on disk, so the shipped commit only goes live after
+**GitHub Integration → Pull** succeeds. The order that works:
+
+1. **Stop** the server (frees the token and the disk while the files change).
+2. **GitHub Integration → Pull** and watch the GitHub tab until it reports the
+   new commit instead of an error.
+3. **Start**, then read the console: `Build <short-sha>` is printed at startup.
+   If that hash is the commit you just pushed, the new code is live; if it is
+   the old one, the pull did not apply and the GitHub tab has the reason.
+
+`start.sh` records a hash of `requirements.txt` in `.deps-stamp` after a
+successful install, so a restart with unchanged dependencies skips pip and
+starts in seconds. Nothing on the server configuration needs to change for a
+release: the command stays `bash start.sh`.
 
 ## Security and hard rules
 
@@ -467,8 +493,13 @@ C extension was never needed.
 - **A NUBAN cannot be predicted from a phone number**, and the bot never claims
   to. The account number is issued by the bank, its check digit only validates
   a number you already hold, and mobile prefixes no longer identify a network.
-  "Associated banks" reports only account details somebody published publicly,
-  so a subject who never posted one yields nothing.
+  That is why the **🏦 Associated bank** tab asks whether the feature is wanted
+  instead of pretending to look one up.
+- Nothing about the debtor is stored. A dossier row keeps the account, the
+  timestamp, how many profiles came back and whether anything was found; the
+  name, phone, gender, company and the reported profile links are not written.
+  The database is therefore a revenue and usage ledger, and `/backup` can send
+  a copy to the operator's Telegram without carrying anyone's personal data.
 - The curated checks do not cover Instagram: logged-out Instagram serves a
   login page that cannot reliably distinguish a real profile, so it is skipped
   rather than reported as a match. Instagram profiles are still found through

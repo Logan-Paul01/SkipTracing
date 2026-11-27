@@ -7,3 +7,4 @@ bot.log
 venv/
 custom_venv/
 .bot.pid
+.deps-stamp

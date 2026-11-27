@@ -169,11 +169,15 @@ def stats_text() -> str:
             f"Accounts: <b>{users}</b>",
             f"Collectors who ran a trace: {data['collectors']}",
             f"Dossiers delivered: {data['dossiers']}",
+            f"With a record: {data['with_record']} · nothing found: "
+            f"{data['no_record']}",
             f"On the waitlist: {data['waitlist']}",
             f"Said they paid: {data['claims']} ({data['pending']} waiting)",
             f"Paid accounts (ever): <b>{payers}</b>",
             f"Paid accounts with an allowance now: {data['active_paid']}",
             f"Conversion: <b>{rate:.1f}%</b> of accounts (go/no-go: 30%)",
+            f"Associated-bank poll: {data['bank_yes']} yes · "
+            f"{data['bank_no']} no",
         )
     )
 

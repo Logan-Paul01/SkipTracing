@@ -425,8 +425,10 @@ async def search_account_details(name: str, company: str = "") -> list[dict]:
 
 The query is the name and company only: a number is never a useful search
     term, and a page that prints an account number also names its holder.
-    Called only when a collector opens the "Associated banks" tab, so a trace
-    that never opens it costs nothing extra.
+    Parked with ``banks.py``: the dossier's bank tab asks whether the feature
+    is wanted instead of looking anything up, so nothing calls this today. It
+    is kept because a published account number is the only version of the
+    feature that can work, and this is where that search would start.
     """
     backend = provider()
     if backend is None:

@@ -1,7 +1,13 @@
-"""SQLite audit log for searches, reported matches and search allowances."""
+"""SQLite counters for searches, revenue and search allowances.
+
+Nothing about the debtor is stored. A dossier row records that a trace ran,
+which account ran it and how many profiles came back, so usage and revenue can
+be counted without keeping a name, a phone number or a profile link.
+"""
 
 from __future__ import annotations
 
+import csv
 import sqlite3
 from contextlib import contextmanager
 
@@ -27,6 +33,43 @@ def _columns(connection, table: str) -> set[str]:
     return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
 
 
+def _purge_debtor_data(connection) -> None:
+    """Blank the debtor details an earlier build kept, exactly once.
+
+    The bot used to store the traced name, phone, gender, company and a table of
+    every profile link it reported. That is gone: the columns are emptied and
+    the old ``matches`` table is dropped. ``meta`` records the purge so it never
+    runs again and no new row is ever written with those fields.
+    """
+    done = connection.execute(
+        "SELECT value FROM meta WHERE key = 'pii_purged'"
+    ).fetchone()
+    if done is not None:
+        return
+
+    columns = _columns(connection, "searches")
+    legacy = [name for name in ("full_name", "phone", "gender", "company")
+              if name in columns]
+    if legacy:
+        connection.execute(
+            "UPDATE searches SET "
+            + ", ".join(f"{name} = NULL" for name in legacy)
+        )
+        # The data is gone either way; dropping the columns also takes them off
+        # the file, so a backup carries no trace of the person. Older SQLite
+        # builds do not support DROP COLUMN, and a refusal here is harmless —
+        # the columns stay empty and are never written again.
+        for name in legacy:
+            try:
+                connection.execute(f"ALTER TABLE searches DROP COLUMN {name}")
+            except sqlite3.Error:
+                continue
+    connection.execute("DROP TABLE IF EXISTS matches")
+    connection.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('pii_purged', '1')"
+    )
+
+
 def _ensure_column(connection, table: str, column: str, ddl: str) -> None:
     """Add a column to a database file created by an older build.
 
@@ -40,33 +83,32 @@ def _ensure_column(connection, table: str, column: str, ddl: str) -> None:
 
 def init_db() -> None:
     with _connect() as connection:
+        # A dossier row is a counter, not a record: who ran it, when, and how
+        # many profiles came back. ``found`` is NULL on rows written before the
+        # flag existed, so an old row is never counted as "nothing found".
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS searches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER,
                 telegram_username TEXT,
-                full_name TEXT,
-                phone TEXT,
-                gender TEXT,
-                company TEXT,
                 variations_count INTEGER,
                 matches_count INTEGER,
+                found INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        # Feature-interest votes: one row per account per feature, replaced if
+        # the same account answers again.
         connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS matches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                search_id INTEGER,
-                site TEXT,
-                url TEXT,
-                display_name TEXT,
-                score INTEGER,
-                reasons TEXT,
-                FOREIGN KEY (search_id) REFERENCES searches (id)
+            CREATE TABLE IF NOT EXISTS feature_votes (
+                telegram_id INTEGER,
+                feature TEXT,
+                vote TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (telegram_id, feature)
             )
             """
         )
@@ -113,6 +155,8 @@ def init_db() -> None:
         _ensure_column(connection, "waitlist", "claimed_paid_at", "claimed_paid_at TEXT")
         _ensure_column(connection, "waitlist", "sender_name", "sender_name TEXT")
         _ensure_column(connection, "waitlist", "resolved_at", "resolved_at TEXT")
+        _ensure_column(connection, "searches", "found", "found INTEGER")
+        _purge_debtor_data(connection)
         # Accounts were only recorded once the allowance existed, so anyone who
         # ran a search before that is backfilled here: /broadcast must reach
         # early users too. INSERT OR IGNORE keeps the counters of live accounts.
@@ -129,58 +173,28 @@ def init_db() -> None:
 def log_search(
     telegram_id,
     telegram_username,
-    full_name,
-    phone,
-    gender,
-    company,
     variations_count,
     matches_count,
+    found: bool = False,
 ) -> int:
+    """Record that a trace ran, with no detail about the person traced."""
     with _connect() as connection:
         cursor = connection.execute(
             """
             INSERT INTO searches (
-                telegram_id, telegram_username, full_name, phone, gender,
-                company, variations_count, matches_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                telegram_id, telegram_username, variations_count, matches_count,
+                found
+            ) VALUES (?, ?, ?, ?, ?)
             """,
             (
                 telegram_id,
                 telegram_username,
-                full_name,
-                phone,
-                gender,
-                company,
                 variations_count,
                 matches_count,
+                1 if found else 0,
             ),
         )
         return int(cursor.lastrowid)
-
-
-def log_matches(search_id: int, matches) -> None:
-    rows = [
-        (
-            search_id,
-            match.get("site"),
-            match.get("url"),
-            match.get("display_name") or match.get("username"),
-            int(match.get("score") or 0),
-            " · ".join(match.get("reasons") or []),
-        )
-        for match in (matches or [])
-    ]
-    if not rows:
-        return
-
-    with _connect() as connection:
-        connection.executemany(
-            """
-            INSERT INTO matches (search_id, site, url, display_name, score, reasons)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
 
 
 USER_DEFAULTS = {
@@ -418,6 +432,15 @@ def stats() -> dict:
         def count(sql: str) -> int:
             return int(connection.execute(sql).fetchone()[0] or 0)
 
+        votes = {
+            str(row[0]): int(row[1])
+            for row in connection.execute(
+                "SELECT vote, COUNT(*) FROM feature_votes WHERE feature = ? "
+                "GROUP BY vote",
+                (FEATURE_ASSOCIATED_BANK,),
+            ).fetchall()
+        }
+
         return {
             "users": count("SELECT COUNT(*) FROM users"),
             "collectors": count(
@@ -425,6 +448,8 @@ def stats() -> dict:
                 "WHERE telegram_id IS NOT NULL"
             ),
             "dossiers": count("SELECT COUNT(*) FROM searches"),
+            "with_record": count("SELECT COUNT(*) FROM searches WHERE found = 1"),
+            "no_record": count("SELECT COUNT(*) FROM searches WHERE found = 0"),
             "waitlist": count("SELECT COUNT(*) FROM waitlist"),
             "claims": count(
                 "SELECT COUNT(*) FROM waitlist WHERE claimed_paid_at IS NOT NULL"
@@ -437,7 +462,116 @@ def stats() -> dict:
             "active_paid": count(
                 "SELECT COUNT(*) FROM users WHERE paid_searches_left > 0"
             ),
+            "bank_yes": votes.get("yes", 0),
+            "bank_no": votes.get("no", 0),
         }
+
+
+def record_vote(telegram_id, feature: str, vote: str) -> None:
+    """Store (or replace) one account's answer to a feature question."""
+    if not telegram_id:
+        return
+    touch_user(telegram_id)
+    with _connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO feature_votes (telegram_id, feature, vote)
+            VALUES (?, ?, ?)
+            ON CONFLICT (telegram_id, feature) DO UPDATE SET
+                vote = excluded.vote,
+                created_at = CURRENT_TIMESTAMP
+            """,
+            (int(telegram_id), str(feature), str(vote)),
+        )
+
+
+def vote_totals(feature: str) -> dict:
+    """How many accounts answered each way for one feature question."""
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT vote, COUNT(*) FROM feature_votes WHERE feature = ? "
+            "GROUP BY vote",
+            (str(feature),),
+        ).fetchall()
+    return {str(row[0]): int(row[1]) for row in rows}
+
+
+# The one feature question asked in the dossier. Kept here so the poll, /stats
+# and the export all read the same key.
+FEATURE_ASSOCIATED_BANK = "associated_bank"
+
+REVENUE_COLUMNS = (
+    "telegram_id",
+    "telegram_username",
+    "first_seen",
+    "last_seen",
+    "plan",
+    "plan_expires_at",
+    "purchases",
+    "paid_searches_left",
+    "free_searches_used",
+    "dossiers",
+    "payment",
+)
+
+
+def revenue_rows() -> list[dict]:
+    """One row per account: what it has paid, spent and still holds.
+
+    This is the revenue side of the database only — money, plans and usage.
+    Nothing about the people who were traced appears here.
+    """
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                u.telegram_id,
+                u.telegram_username,
+                u.first_seen,
+                u.last_seen,
+                u.plan,
+                u.plan_expires_at,
+                u.purchases,
+                u.paid_searches_left,
+                u.free_searches_used,
+                (SELECT COUNT(*) FROM searches s
+                  WHERE s.telegram_id = u.telegram_id) AS dossiers,
+                CASE
+                    WHEN w.telegram_id IS NULL THEN ''
+                    WHEN w.resolved_at IS NOT NULL THEN 'confirmed'
+                    WHEN w.claimed_paid_at IS NOT NULL THEN 'claimed'
+                    ELSE 'waitlist'
+                END AS payment
+            FROM users u
+            LEFT JOIN waitlist w ON w.telegram_id = u.telegram_id
+            ORDER BY u.first_seen ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def export_revenue_csv(path) -> int:
+    """Write the revenue rows to ``path`` and return how many were written."""
+    rows = revenue_rows()
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(REVENUE_COLUMNS))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key) for key in REVENUE_COLUMNS})
+    return len(rows)
+
+
+def backup_to(path) -> None:
+    """Write a consistent copy of the live database while the bot keeps running."""
+    source = sqlite3.connect(config.DB_PATH, timeout=10)
+    try:
+        destination = sqlite3.connect(path)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
 
 
 def meta_get(key: str, default: str = "") -> str:

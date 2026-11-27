@@ -1,5 +1,10 @@
 """Bank-account details a page already published next to the subject.
 
+Parked: the dossier's 🏦 Associated bank tab now asks collectors whether they
+want such a feature instead of looking anything up, so nothing calls this
+module. It is kept because it is the only workable version of the idea — the
+account number somebody published themselves — should the poll come back yes.
+
 A NUBAN cannot be predicted from a phone number. The 10-digit account number is
 issued by the bank, its check digit only validates a number you already hold,
 and Nigerian mobile prefixes carry no bank information (portability removed

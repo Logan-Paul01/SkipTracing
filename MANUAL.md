@@ -57,9 +57,17 @@ setsid nohup custom_venv/bin/python -u bot.py >> bot.log 2>&1 < /dev/null & echo
 
 ## Data model
 
-`searches` / `matches` — one row per dossier and one per reported page, with the
-collector's Telegram ID, the subject, score and reasons. Written after every
-trace; a write failure is logged and never breaks the dossier.
+`searches` — one row per dossier: collector's Telegram ID, timestamp, candidate
+count, match count and `found` (1 when the dossier carried a record, 0 when it
+came back empty, NULL on rows written before the flag existed). **No debtor
+detail is stored:** the name, phone, gender, company and the reported profile
+links are gone, and a build that still has them blanks them once on start
+(`_purge_debtor_data`, guarded by `meta.pii_purged`). A write failure is logged
+and never breaks the dossier.
+
+`feature_votes` — `telegram_id`, `feature`, `vote`, `created_at`; one row per
+account per feature question, replaced when the account answers again. Today it
+holds the associated-bank poll (`associated_bank` → `yes` / `no`).
 
 `users` — one row per Telegram account, created on first contact:
 
@@ -78,7 +86,8 @@ trace; a write failure is logged and never breaks the dossier.
 it shows how many collectors got as far as being asked to pay, and
 `db.pending_claims()` lists the ones still waiting for a decision.
 
-`meta` — `owner_id` is stored here after the first `/broadcast`.
+`meta` — `owner_id` is stored here after the first `/broadcast`, plus
+`pii_purged` once the debtor columns have been cleaned.
 
 ## Search allowance, waitlist and manual payment
 
@@ -107,13 +116,25 @@ Flow in `bot.py`:
    counted.
 
 Each dossier is one message with two stacked buttons — **🏅 Top matching
-profiles** and **🏦 Associated banks** — and each opens by editing that same
+profiles** and **🏦 Associated bank** — and each opens by editing that same
 message, with **⬅️ Back to dossier** to return. Views are held in memory under
 a short token for six hours (`VIEWS` in `bot.py`), only open for the account
 that ran the trace, and old buttons say the dossier expired after a restart.
-The banks view scans the pages the trace already returned, then runs one extra
-search for published account details; it never guesses a NUBAN, because one
-cannot be derived from a phone number.
+
+The bank tab is a **feature question, not a lookup**. It says in plain words
+what an associated-bank lookup would do — take the phone number from step 2 and
+show the bank the account is held with — states that it is not available because
+a phone number does not carry the bank, and offers **✅ Yes, I would use it** and
+**🙅 No, I would not**. Answers go to `feature_votes` and are counted in
+`/stats`; a second answer replaces the first. The copy stays neutral: it asks
+whether the feature is wanted, it does not argue for it.
+
+A trace that finds nothing ends with **📖 How to get better results**, which
+opens `/guide`: what details help (full name, company, city/state, a known
+variant of the name), what the bot cannot do (look a phone number up, see
+private or logged-in pages) and how to read a dossier. It deliberately does not
+tell the collector to run the same trace again with something added — that is
+what makes a thin result feel like a dead end.
 
 **The paid plan is a waitlist with manual payment; no provider is connected.**
 `/premium` (and the paywall) prints the offer plus the bank, account name and
@@ -179,6 +200,10 @@ accounts with an allowance now, and the conversion percentage against the 30%
 go/no-go line. Below the counters it lists every claim still waiting, with the
 sender name and ID, so a card that was scrolled past can still be acted on.
 
+`/backup` sends the database and the revenue CSV to the operator's chat, so the
+ledger is recoverable without SSH or FTP; that is the only backup that survives
+the panel.
+
 A payment that arrives before the operator has claimed ownership is not lost:
 the claim is stored, and claiming `/broadcast` immediately re-sends every
 waiting claim as a card. Until then the bot logs a warning on startup that no
@@ -189,11 +214,13 @@ operator is set.
 Accounts: 12
 Collectors who ran a trace: 9
 Dossiers delivered: 40
+With a record: 31 · nothing found: 9
 On the waitlist: 5
-Said they paid: 2
+Said they paid: 2 (0 waiting)
 Paid accounts (ever): 2
 Paid accounts with an allowance now: 2
 Conversion: 16.7% of accounts (go/no-go: 30%)
+Associated-bank poll: 4 yes · 1 no
 ```
 
 Ownership, without configuring a Telegram ID:
@@ -272,9 +299,10 @@ Worker process only: no port, no webhook, no inbound traffic.
 
 1. Technology **Python**, GitHub integration → `Logan-Paul01/SkipTracing`,
    branch `main`. Wispbyte has no push webhook: **Pull**, then restart.
-2. Startup command: `bash start.sh` (installs `requirements.txt`, then runs
-   `python -u bot.py`). `pip install -r requirements.txt && python bot.py` also
-   works if the panel runs it as a shell line.
+2. Startup command: `bash start.sh` (installs `requirements.txt` unless the
+   file is unchanged since the last install, then runs `python -u bot.py`).
+   `pip install -r requirements.txt && python bot.py` also works if the panel
+   runs it as a shell line.
 3. Server Configuration → secrets: `BOT_TOKEN`, `EXA_API_KEY` (or
    `TAVILY_API_KEY`), `OWNER_ID`, `PAYMENT_BANK`, `PAYMENT_ACCOUNT_NAME`,
    `PAYMENT_ACCOUNT_NUMBER`. If custom variables are refused, upload a `.env`
@@ -283,6 +311,32 @@ Worker process only: no port, no webhook, no inbound traffic.
 4. Watch the console for `Authenticated as @...`.
 5. Make sure the filesystem holding `DB_PATH` persists, otherwise the account
    counters reset on restart and every user gets ten fresh free searches.
+
+### Updating the live server
+
+A restart does **not** fetch code: it re-runs `start.sh` against the files
+already on disk. The new commit only goes live after a successful pull.
+
+1. **Stop** the server.
+2. **GitHub Integration → Pull**; watch the GitHub tab until it shows the new
+   commit rather than an error.
+3. **Start** and read the console. `Build <short-sha>` is logged at startup; if
+   it matches the commit just pushed, the release is live. If it is the old
+   hash, the pull did not apply — the GitHub tab has the reason.
+
+No server configuration changes for a release: the command stays
+`bash start.sh`, and `.deps-stamp` makes an unchanged `requirements.txt` skip
+pip so a restart takes seconds instead of a download.
+
+### Backing up: /backup
+
+Owner-only and hidden like `/stats`. It writes a consistent copy of the live
+database and a revenue CSV, sends both to the operator in Telegram, then deletes
+its temporary files — the panel's 1 GB disk does not keep a second copy. The CSV
+has one row per account: id, username, first/last seen, plan, expiry, purchases,
+paid searches left, free searches used, dossiers run and payment state
+(`waitlist` / `claimed` / `confirmed`). Neither file contains anything about a
+traced person.
 
 ## Gotchas
 
